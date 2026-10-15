@@ -1,0 +1,136 @@
+{% extends 'base.html' %}
+{% block title %}AgriWise AI | Home{% endblock %}
+{% block body_class %}public-home{% endblock %}
+{% block content %}
+<div class="product-home-page">
+<section class="product-hero" aria-labelledby="hero-title" data-motion='{"keyframes":{"opacity":[0,1],"y":[30,0]},"duration":0.75,"delay":0.05,"hover":{"to":{"y":-6,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.25}}'>
+  <div class="product-hero__content" data-motion='{"keyframes":{"opacity":[0,1],"x":[20,0]},"duration":0.7,"delay":0.12}'>
+    <p class="product-eyebrow"><span></span> {{ t('home.eyebrow') }}</p>
+    <h1 id="hero-title">{{ t('home.hero_title') }}</h1>
+    <p class="product-hero__tagline">{{ t('home.tagline') }}</p>
+    <p class="product-hero__description">{{ t('home.description') }}</p>
+    <div class="product-hero__actions">
+      {% if session.get('user_id') %}
+        <a class="product-button product-button--light" href="{{ url_for('dashboard') }}">{{ t('home.open_dashboard') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+      {% else %}
+        <a class="product-button product-button--light" href="{{ url_for('register') }}">{{ t('home.start_farming_smarter') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+        <a class="product-button product-button--outline" href="{{ url_for('login') }}">{{ t('home.login') }}</a>
+      {% endif %}
+    </div>
+    <ul class="product-hero__proof" aria-label="{{ t('home.capabilities_title') }}">
+      <li><i class="fa-solid fa-seedling" aria-hidden="true"></i> {{ t('home.crop_choices') }}</li>
+      <li><i class="fa-solid fa-cloud-sun" aria-hidden="true"></i> {{ t('home.local_weather') }}</li>
+      <li><i class="fa-solid fa-check-double" aria-hidden="true"></i> {{ t('home.confirmed_actions') }}</li>
+    </ul>
+  </div>
+  <div class="product-hero__visual" role="img" aria-label="{{ t('home.field_context') }}. {{ t('home.weather_aware_planning') }}. {{ t('home.farmer_in_control') }}" data-motion='{"keyframes":{"opacity":[0,1],"y":[30,0],"scale":[0.96,1]},"duration":0.85,"delay":0.2,"hover":{"to":{"y":-8,"rotate":1.2},"from":{"y":0,"rotate":0},"duration":0.3}}'>
+    <div class="product-hero__visual-sun"></div>
+    <div class="product-hero__visual-hills"></div>
+    <div class="product-hero__visual-field" data-farm-scene="field" data-scene-state="loading" aria-hidden="true"><canvas></canvas></div>
+    <div class="product-hero__visual-card" data-motion='{"keyframes":{"opacity":[0,1],"y":[14,0]},"duration":0.7,"delay":0.4}'>
+      <span class="product-hero__visual-label"><i class="fa-solid fa-location-dot" aria-hidden="true"></i> {{ t('home.field_context') }}</span>
+      <span class="product-hero__visual-title">{{ t('home.weather_aware_planning') }}</span>
+      <span class="product-hero__visual-note">{{ t('home.farmer_in_control') }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="product-section product-spotlight" aria-labelledby="spotlight-title">
+  <div class="product-section__heading">
+    <div>
+      <p class="product-kicker">Farm intelligence</p>
+      <h2 id="spotlight-title">A richer field command center for every decision</h2>
+    </div>
+  </div>
+
+  <div class="product-metrics-strip" aria-label="AgriWise metrics overview">
+    <div class="product-stat-card" data-motion='{"keyframes":{"opacity":[0,1],"y":[24,0]},"duration":0.7,"delay":0.15,"hover":{"to":{"y":-8,"scale":1.02},"from":{"y":0,"scale":1},"duration":0.22}}'>
+      <span class="product-stat-card__label">Crop recommendation</span>
+      <strong>94%</strong>
+      <small>Decision confidence</small>
+    </div>
+    <div class="product-stat-card" data-motion='{"keyframes":{"opacity":[0,1],"y":[24,0]},"duration":0.7,"delay":0.2,"hover":{"to":{"y":-8,"scale":1.02},"from":{"y":0,"scale":1},"duration":0.22}}'>
+      <span class="product-stat-card__label">Weather watch</span>
+      <strong>7 days</strong>
+      <small>Forecast outlook</small>
+    </div>
+    <div class="product-stat-card" data-motion='{"keyframes":{"opacity":[0,1],"y":[24,0]},"duration":0.7,"delay":0.25,"hover":{"to":{"y":-8,"scale":1.02},"from":{"y":0,"scale":1},"duration":0.22}}'>
+      <span class="product-stat-card__label">Farm actions</span>
+      <strong>18 tasks</strong>
+      <small>Tracked and scheduled</small>
+    </div>
+  </div>
+
+  <div class="product-spotlight__board" aria-label="Operational overview panels">
+    <article class="board-panel board-panel--primary" data-motion='{"keyframes":{"opacity":[0,1],"x":[30,0]},"duration":0.85,"delay":0.1}'>
+      <div class="board-panel__header">
+        <span>Farm pulse</span>
+        <i class="fa-solid fa-heart-pulse" aria-hidden="true"></i>
+      </div>
+      <h3>Healthy crop trajectory</h3>
+      <div class="board-panel__score"><strong>82</strong><span>risk score</span></div>
+      <ul>
+        <li>Soil moisture trending stable</li>
+        <li>Irrigation window is favorable</li>
+        <li>Fertilizer timing recommended</li>
+      </ul>
+    </article>
+
+    <article class="board-panel board-panel--graph" data-motion='{"keyframes":{"opacity":[0,1],"y":[22,0]},"duration":0.8,"delay":0.2}'>
+      <div class="board-panel__header">
+        <span>Yield outlook</span>
+        <i class="fa-solid fa-chart-line" aria-hidden="true"></i>
+      </div>
+      <div class="mini-bars" aria-hidden="true">
+        <span style="height: 48%"></span>
+        <span style="height: 58%"></span>
+        <span style="height: 74%"></span>
+        <span style="height: 68%"></span>
+        <span style="height: 88%"></span>
+        <span style="height: 96%"></span>
+      </div>
+      <p>Strong crop momentum this week with a favorable rainfall forecast.</p>
+    </article>
+
+    <article class="board-panel board-panel--accent" data-motion='{"keyframes":{"opacity":[0,1],"x":[-30,0]},"duration":0.85,"delay":0.28}'>
+      <div class="board-panel__header">
+        <span>Market pulse</span>
+        <i class="fa-solid fa-bag-shopping" aria-hidden="true"></i>
+      </div>
+      <h3>+12.4%</h3>
+      <p>Price potential compared with last cycle in the same region.</p>
+      <div class="timeline-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+    </article>
+  </div>
+</section>
+
+<section class="product-section product-workflow" aria-labelledby="workflow-title">
+  <div class="product-section__heading"><div><p class="product-kicker">{{ t('home.workflow_title') }}</p><h2 id="workflow-title">{{ t('home.workflow_title') }}</h2></div></div>
+  <ol class="workflow-steps">
+    <li><span>01</span><div><h3>{{ t('home.step_understand') }}</h3><p>{{ t('home.step_understand_desc') }}</p></div></li>
+    <li><span>02</span><div><h3>{{ t('home.step_review') }}</h3><p>{{ t('home.step_review_desc') }}</p></div></li>
+    <li><span>03</span><div><h3>{{ t('home.step_track') }}</h3><p>{{ t('home.step_track_desc') }}</p></div></li>
+    <li><span>04</span><div><h3>{{ t('home.step_records') }}</h3><p>{{ t('home.step_records_desc') }}</p></div></li>
+  </ol>
+</section>
+
+<section class="product-proof-band">
+  <div><span class="product-proof-band__index">01</span><h2>{{ t('home.proof_title') }}</h2></div>
+  <p>{{ t('home.proof_description') }}</p>
+  {% if session.get('user_id') %}
+    <a class="product-button product-button--dark" href="{{ url_for('dashboard') }}">{{ t('home.continue_to_farm') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+  {% else %}
+    <a class="product-button product-button--dark" href="{{ url_for('register') }}">{{ t('home.start_with_your_farm') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+  {% endif %}
+</section>
+
+<section class="product-section product-capabilities" aria-labelledby="capabilities-title">
+  <div class="product-section__heading"><div><p class="product-kicker">{{ t('home.capabilities_title') }}</p><h2 id="capabilities-title">{{ t('home.capabilities_title') }}</h2></div></div>
+  <div class="capability-list">
+    <article><span>01</span><div><h3>{{ t('home.capability_1') }}</h3><p>{{ t('home.capability_1_desc') }}</p></div><i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></article>
+    <article><span>02</span><div><h3>{{ t('home.capability_2') }}</h3><p>{{ t('home.capability_2_desc') }}</p></div><i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></article>
+    <article><span>03</span><div><h3>{{ t('home.capability_3') }}</h3><p>{{ t('home.capability_3_desc') }}</p></div><i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></article>
+  </div>
+</section>
+</div>
+{% endblock %}

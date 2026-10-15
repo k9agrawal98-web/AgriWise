@@ -1,0 +1,1864 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import uuid
+import math
+import io
+import secrets
+from datetime import date, datetime, timedelta, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import urlsplit
+
+from flask import (
+    Flask,
+    current_app,
+    flash,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    send_from_directory,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+from PIL import Image, UnidentifiedImageError
+from dotenv import load_dotenv
+from config import UPLOAD_DIR, SECRET_KEY, SERVERLESS
+
+from db import DB_PATH, get_db_connection, init_db as db_init
+from services.activity_service import (
+    generate_stage_activities,
+    get_activity_counts,
+    is_overdue,
+)
+from services.crop_decision_service import rank_and_explain_crops
+from services.crop_ml_service import (
+    get_model_evaluation_metrics,
+    predict_crop_ml,
+)
+from services.crop_service import (
+    compare_crop_dataset_fit,
+    ensure_model_exists,
+    predict_crop,
+)
+from services.decision_orchestrator import (
+    FarmState,
+    build_seven_day_action_plan,
+    build_unified_daily_farm_plan,
+)
+from services.disease_service import (
+    analyze_crop_issue,
+    get_past_problem_reports,
+)
+from services.expert_system import (
+    evaluate_expert_system,
+    generate_advisories,
+)
+from services.explanation_service import build_explanation
+from services.fertilizer_service import analyze_nutrients_and_advise
+from services.lifecycle_service import (
+    get_all_supported_crops,
+    get_crop_stage_summary,
+    get_lifecycle_profile,
+)
+from services.i18n_service import (
+    DEFAULT_LANGUAGE,
+    SUPPORTED_LANGUAGES,
+    is_supported_language,
+    translate,
+)
+from services.location_service import (
+    get_default_farm_location,
+    is_valid_coordinates,
+    reverse_geocode,
+)
+from services.market_forecast_service import generate_price_forecast
+from services.market_service import (
+    get_all_commodities,
+    get_market_prices_for_commodity,
+)
+from services.notification_service import (
+    create_notification,
+    get_user_notifications,
+    mark_all_notifications_as_read,
+    mark_notification_as_read,
+)
+from services.profit_service import (
+    aggregate_farm_financials,
+    calculate_crop_profit_potential,
+)
+from services.report_service import generate_comprehensive_farm_report
+from services.resource_service import (
+    get_nearby_resources,
+    get_resource_types,
+)
+from services.risk_service import (
+    analyze_comprehensive_farm_risk,
+    analyze_farm_risk,
+)
+from services.weather_analysis import analyze_forecast
+from services.weather_service import WeatherError, fetch_weather_data
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
+UPLOAD_FOLDER = UPLOAD_DIR
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+MAX_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024
+
+
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        conn = get_db_connection(current_app.config["DATABASE"])
+        g.db = conn
+    return g.db
+
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def validate_crop_inputs(data: Mapping[str, Any], include_moisture: bool = False) -> Dict[str, Optional[float]]:
+    fields = ("nitrogen", "phosphorus", "potassium", "ph", "temperature", "humidity", "rainfall")
+    try:
+        values: Dict[str, Optional[float]] = {
+            field: float(data[field])
+            for field in fields
+        }
+        if include_moisture:
+            moisture = data.get("moisture")
+            values["moisture"] = float(moisture) if moisture not in (None, "") else None
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Enter valid numeric values for all required soil and climate inputs.") from None
+
+    if not all(math.isfinite(value) for value in values.values() if value is not None):
+        raise ValueError("Enter finite numeric values for all soil and climate inputs.")
+    if not 0 <= values["ph"] <= 14:
+        raise ValueError("pH must be between 0 and 14.")
+    if not 0 <= values["humidity"] <= 100:
+        raise ValueError("Humidity must be between 0 and 100.")
+    if not -50 <= values["temperature"] <= 60:
+        raise ValueError("Temperature must be between -50 and 60 °C.")
+    if any(values[field] < 0 for field in ("nitrogen", "phosphorus", "potassium", "rainfall")):
+        raise ValueError("Nutrients and rainfall must be nonnegative.")
+    if include_moisture and values["moisture"] is not None and not 0 <= values["moisture"] <= 100:
+        raise ValueError("Moisture must be between 0 and 100.")
+    return values
+
+
+def valid_password(password: str) -> bool:
+    return 8 <= len(password) <= 128 and any(character.isalpha() for character in password) and any(character.isdigit() for character in password)
+
+
+def valid_email(email: str) -> bool:
+    return len(email) <= 254 and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) is not None
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not g.get('current_user'):
+            flash("Please log in to continue.", "warning")
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def get_current_user() -> Optional[Dict[str, Any]]:
+    user_id = session.get("user_id")
+    auth_token = session.get('auth_token')
+    if not user_id or not auth_token:
+        return None
+    row = get_db().execute("SELECT * FROM users WHERE id = ? AND auth_token = ?", (user_id, auth_token)).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_farm(user_id: int) -> Optional[Dict[str, Any]]:
+    row = get_db().execute(
+        "SELECT * FROM farms WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_soil_record(farm_id: int) -> Optional[Dict[str, Any]]:
+    row = get_db().execute(
+        "SELECT * FROM soil_records WHERE farm_id = ? ORDER BY id DESC LIMIT 1",
+        (farm_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_cycle(farm_id: int) -> Optional[Dict[str, Any]]:
+    row = get_db().execute(
+        "SELECT * FROM crop_cycles WHERE farm_id = ? ORDER BY id DESC LIMIT 1",
+        (farm_id,),
+    ).fetchone()
+    if not row:
+        return None
+    cycle = dict(row)
+    cycle.update(get_crop_stage_summary(cycle["crop_name"], cycle["sowing_date"]))
+    return cycle
+
+
+def ensure_lifecycle_activities(db: sqlite3.Connection, farm_id: int, cycle: Dict[str, Any]) -> int:
+    summary = get_crop_stage_summary(cycle["crop_name"], cycle["sowing_date"])
+    stage = summary["current_stage"]
+    recommendations = generate_stage_activities(cycle["crop_name"], stage, date.today())
+    created = 0
+    for activity in recommendations:
+        existing = db.execute(
+            """SELECT id FROM farm_activities
+               WHERE farm_id = ? AND crop_cycle_id = ? AND crop_stage = ? AND title = ?""",
+            (farm_id, cycle["id"], stage, activity["title"]),
+        ).fetchone()
+        if existing:
+            continue
+        db.execute(
+            """INSERT INTO farm_activities
+               (crop_cycle_id, farm_id, activity_type, title, description, reason, evidence,
+                crop_stage, recommended_date, due_date, priority, urgency, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')""",
+            (
+                cycle["id"], farm_id, activity["activity_type"], activity["title"],
+                activity["description"], activity["reason"], activity["evidence"],
+                stage, activity["recommended_date"], activity["due_date"], activity["priority"], activity["urgency"],
+            ),
+        )
+        created += 1
+    if created:
+        db.commit()
+    return created
+
+
+def get_latest_weather(farm_id: int) -> Optional[Dict[str, Any]]:
+    row = get_db().execute(
+        "SELECT * FROM weather_records WHERE farm_id = ? ORDER BY id DESC LIMIT 1",
+        (farm_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_recommendation(farm_id: int) -> Optional[Dict[str, Any]]:
+    row = get_db().execute(
+        "SELECT * FROM crop_recommendations WHERE farm_id = ? ORDER BY id DESC LIMIT 1",
+        (farm_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def load_farm_state_object(db: sqlite3.Connection, farm_id: int, user_id: int) -> FarmState:
+    farmer = dict(db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone() or {})
+    farm = dict(db.execute("SELECT * FROM farms WHERE id = ?", (farm_id,)).fetchone() or {})
+    soil_row = db.execute("SELECT * FROM soil_records WHERE farm_id = ? ORDER BY id DESC LIMIT 1", (farm_id,)).fetchone()
+    soil = dict(soil_row) if soil_row else {}
+    cycle_row = db.execute("SELECT * FROM crop_cycles WHERE farm_id = ? ORDER BY id DESC LIMIT 1", (farm_id,)).fetchone()
+    cycle = dict(cycle_row) if cycle_row else None
+    if cycle:
+        cycle.update(get_crop_stage_summary(cycle["crop_name"], cycle["sowing_date"]))
+
+    weather_row = db.execute("SELECT * FROM weather_records WHERE farm_id = ? ORDER BY id DESC LIMIT 1", (farm_id,)).fetchone()
+    weather = {"current": dict(weather_row)} if weather_row else {"current": {}}
+    if farm.get("latitude") and farm.get("longitude"):
+        try:
+            weather = fetch_weather_data(float(farm["latitude"]), float(farm["longitude"]))
+        except Exception:
+            pass
+
+    act_rows = db.execute("SELECT * FROM farm_activities WHERE farm_id = ? ORDER BY due_date ASC", (farm_id,)).fetchall()
+    activities = [dict(r) for r in act_rows]
+
+    dr_rows = db.execute("SELECT * FROM disease_reports WHERE farm_id = ? ORDER BY id DESC", (farm_id,)).fetchall()
+    disease_reports = [dict(r) for r in dr_rows]
+
+    exp_rows = db.execute("SELECT * FROM farm_expenses WHERE farm_id = ? ORDER BY date DESC", (farm_id,)).fetchall()
+    expenses = [dict(r) for r in exp_rows]
+
+    sales_rows = db.execute("SELECT * FROM sales WHERE farm_id = ? ORDER BY sale_date DESC", (farm_id,)).fetchall()
+    sales = [dict(r) for r in sales_rows]
+
+    return FarmState(
+        farmer=farmer,
+        farm=farm,
+        soil=soil,
+        crop_cycle=cycle,
+        weather=weather,
+        activities=activities,
+        disease_reports=disease_reports,
+        expenses=expenses,
+        sales=sales,
+    )
+
+
+def create_app(test_config=None) -> Flask:
+    app = Flask(__name__)
+    app.config["SECRET_KEY"] = os.environ.get('AGRIWISE_SECRET_KEY') or SECRET_KEY
+    app.config["DATABASE"] = str(DB_PATH)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_UPLOAD_BYTES + 64 * 1024
+    app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=12)
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    production = SERVERLESS or os.environ.get('AGRIWISE_ENV', '').lower() == 'production'
+    app.config['SESSION_COOKIE_SECURE'] = production or os.environ.get('AGRIWISE_SECURE_COOKIES', '').lower() == 'true'
+    if production and not os.environ.get('AGRIWISE_SECRET_KEY'):
+        raise RuntimeError('AGRIWISE_SECRET_KEY must be configured in production.')
+    if test_config:
+        app.config.update(test_config)
+
+    @app.teardown_appcontext
+    def close_db(_):
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+
+    @app.after_request
+    def set_security_headers(response):
+        response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+        response.headers.setdefault('X-Frame-Options', 'DENY')
+        response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+        response.headers.setdefault('Permissions-Policy', 'camera=(), microphone=(), geolocation=(self)')
+        response.headers.setdefault('Content-Security-Policy', "base-uri 'self'; object-src 'none'; frame-ancestors 'none'")
+        return response
+
+    db_init(app.config["DATABASE"])
+    # Missing models are handled at prediction time; startup must not retrain.
+
+    @app.before_request
+    def load_global_context():
+        session.setdefault('csrf_token', secrets.token_urlsafe(32))
+        if not is_supported_language(session.get("language")):
+            session["language"] = DEFAULT_LANGUAGE
+        if request.method == 'POST' and current_app.config.get('CSRF_ENABLED', not current_app.testing):
+            supplied = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token', '')
+            if not secrets.compare_digest(supplied, session['csrf_token']):
+                return render_template('error.html', message='Form expired. Reload the page and try again.'), 400
+        if request.path.startswith('/static/uploads/'):
+            return render_template('error.html', message='Use the authorized report image link.'), 403
+        g.current_user = get_current_user()
+        if session.get('user_id') and not g.current_user:
+            session.clear()
+            session['csrf_token'] = secrets.token_urlsafe(32)
+        if g.current_user:
+            g.current_farm = get_user_farm(g.current_user["id"])
+            try:
+                row = get_db().execute(
+                    "SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND is_read = 0",
+                    (g.current_user["id"],),
+                ).fetchone()
+                g.unread_notifications = row["c"] if row else 0
+            except Exception:
+                g.unread_notifications = 0
+        else:
+            g.current_farm = None
+            g.unread_notifications = 0
+
+    @app.context_processor
+    def inject_template_globals():
+        return {
+            "current_user": g.get("current_user"),
+            "user": g.get("current_user"),
+            "current_farm": g.get("current_farm"),
+            "farm": g.get("current_farm"),
+            "unread_notifications_count": g.get("unread_notifications", 0),
+            "csrf_token": session.get('csrf_token', ''),
+            "current_language": session.get("language", DEFAULT_LANGUAGE),
+            "supported_languages": SUPPORTED_LANGUAGES,
+            "t": lambda key, **values: translate(session.get("language"), key, **values),
+        }
+
+    # ==========================================
+    # AUTHENTICATION & ONBOARDING
+    # ==========================================
+
+    @app.route('/healthz')
+    def health_check():
+        get_db().execute('SELECT 1').fetchone()
+        return jsonify(status='ok')
+
+    @app.route("/language", methods=["POST"])
+    def set_language():
+        selected_language = request.form.get("language")
+        if not is_supported_language(selected_language):
+            return render_template(
+                "error.html",
+                message="Unsupported language. Choose English, Marathi, or Hindi.",
+            ), 400
+        session["language"] = selected_language
+        next_path = request.form.get("next") or url_for("index")
+        parsed_path = urlsplit(next_path)
+        if (
+            not next_path.startswith("/")
+            or next_path.startswith("//")
+            or parsed_path.scheme
+            or parsed_path.netloc
+        ):
+            next_path = url_for("index")
+        return redirect(next_path)
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+    @app.route("/about")
+    def about():
+        return render_template("about.html")
+
+    @app.route("/register", methods=["GET", "POST"])
+    def register():
+        if request.method == "POST":
+            name = (request.form.get("name") or "").strip()
+            email = (request.form.get("email") or "").strip().lower()
+            password = request.form.get("password") or ""
+
+            if not name or len(name) > 120 or not valid_email(email) or not valid_password(password):
+                flash("Unable to create an account with those details.", "danger")
+                return render_template("register.html")
+
+            if get_db().execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+                flash("Unable to create an account with those details.", "danger")
+                return render_template("register.html")
+
+            hashed = generate_password_hash(password)
+            auth_token = secrets.token_urlsafe(32)
+            cursor = get_db().execute(
+                "INSERT INTO users (name, email, password_hash, auth_token) VALUES (?, ?, ?, ?)",
+                (name, email, hashed, auth_token),
+            )
+            get_db().commit()
+            session.clear()
+            session["user_id"] = cursor.lastrowid
+            session['auth_token'] = auth_token
+            session.permanent = True
+            flash("Welcome to AgriWise AI! Please configure your farm location to begin.", "success")
+            return redirect(url_for("farm_setup"))
+
+        return render_template("register.html")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            email = (request.form.get("email") or "").strip().lower()
+            password = request.form.get("password") or ""
+            row = get_db().execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+            if row and len(password) <= 128 and check_password_hash(row["password_hash"], password):
+                session.clear()
+                session["user_id"] = row["id"]
+                session['auth_token'] = row['auth_token']
+                session.permanent = True
+                farm = get_user_farm(row["id"])
+                flash("Welcome back to AgriWise AI.", "success")
+                if not farm:
+                    return redirect(url_for("farm_setup"))
+                return redirect(url_for("dashboard"))
+            flash("Invalid email or password.", "danger")
+        return render_template("login.html")
+
+    @app.route("/logout", methods=["POST"])
+    def logout():
+        session.clear()
+        flash("You have been logged out securely.", "info")
+        return redirect(url_for("login"))
+
+    # ==========================================
+    # FARM SETUP WIZARD & PROFILE
+    # ==========================================
+
+    @app.route("/farm/setup", methods=["GET", "POST"])
+    @login_required
+    def farm_setup():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+
+        if request.method == "POST":
+            soil_values = {
+                field: request.form.get(field, "")
+                for field in ("nitrogen", "phosphorus", "potassium", "ph", "moisture")
+            }
+
+            def render_setup_error(message):
+                flash(message, "danger")
+                return render_template(
+                    "farm_setup.html",
+                    farm=farm,
+                    soil=soil_values,
+                    default_lat=farm["latitude"] if farm and farm["latitude"] else None,
+                    default_lon=farm["longitude"] if farm and farm["longitude"] else None,
+                    default_location=farm["location_name"] if farm and farm["location_name"] else "",
+                )
+
+            farm_name = (request.form.get("farm_name") or "").strip()
+            location_name = (request.form.get("location_name") or "").strip()
+            latitude = request.form.get("latitude")
+            longitude = request.form.get("longitude")
+            area = request.form.get("area") or "1.0"
+            area_unit = request.form.get("area_unit") or "acre"
+            water_source = (request.form.get("water_source") or "Well").strip()
+            soil_type = (request.form.get("soil_type") or "Black").strip()
+            irrigation_type = (request.form.get("irrigation_type") or "Drip").strip()
+            water_availability = (request.form.get("water_availability") or "Medium").strip()
+            previous_crop = (request.form.get("previous_crop") or "").strip()
+            if not farm_name:
+                return render_setup_error("Farm name is required.")
+
+            try:
+                area_val = float(area)
+                if not math.isfinite(area_val) or area_val <= 0:
+                    raise ValueError
+            except ValueError:
+                return render_setup_error("Farm area must be a positive number.")
+
+            lat_val = None
+            lon_val = None
+            if latitude and longitude:
+                try:
+                    lat_val = float(latitude)
+                    lon_val = float(longitude)
+                    if not is_valid_coordinates(lat_val, lon_val):
+                        raise ValueError
+                except ValueError:
+                    return render_setup_error("Coordinates are invalid. Latitude must be -90..90 and Longitude -180..180.")
+
+            try:
+                soil_values = {
+                    field: float(soil_values[field])
+                    for field in ("nitrogen", "phosphorus", "potassium", "ph")
+                } | {"moisture": float(soil_values["moisture"]) if soil_values["moisture"] else None}
+                if not all(math.isfinite(value) for value in soil_values.values() if value is not None):
+                    raise ValueError
+                if any(soil_values[field] < 0 for field in ("nitrogen", "phosphorus", "potassium")):
+                    raise ValueError
+                if not 0 <= soil_values["ph"] <= 14:
+                    raise ValueError
+                if soil_values["moisture"] is not None and not 0 <= soil_values["moisture"] <= 100:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return render_setup_error(
+                    "Enter measured nitrogen, phosphorus, potassium, and pH values from a soil test. "
+                    "Nutrients must be nonnegative, pH must be 0–14, and moisture must be 0–100%."
+                )
+
+            if farm:
+                get_db().execute(
+                    """
+                    UPDATE farms
+                    SET farm_name = ?, location_name = ?, latitude = ?, longitude = ?, area = ?,
+                        area_unit = ?, water_source = ?, soil_type = ?, irrigation_type = ?,
+                        water_availability = ?, previous_crop = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (farm_name, location_name, lat_val, lon_val, area_val, area_unit, water_source, soil_type, irrigation_type, water_availability, previous_crop, farm["id"]),
+                )
+                farm_id = farm["id"]
+                flash("Farm profile updated successfully.", "success")
+            else:
+                cursor = get_db().execute(
+                    """
+                    INSERT INTO farms
+                    (user_id, farm_name, location_name, latitude, longitude, area, area_unit,
+                     water_source, soil_type, irrigation_type, water_availability, previous_crop)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user["id"], farm_name, location_name, lat_val, lon_val, area_val, area_unit, water_source, soil_type, irrigation_type, water_availability, previous_crop),
+                )
+                farm_id = cursor.lastrowid
+                flash("Farm profile saved. Next step: recommend a suitable crop for this field.", "success")
+
+            get_db().execute("UPDATE farms SET farm_type=?, risk_preference=?, preferred_crop_type=?, previous_harvest_date=?, budget_range=? WHERE id=?",
+                (request.form.get('farm_type', 'Mixed'), request.form.get('risk_preference', 'Balanced'), request.form.get('preferred_crop_type', 'No preference'), request.form.get('previous_harvest_date') or None, request.form.get('budget_range'), farm_id))
+
+            get_db().execute(
+                """
+                INSERT INTO soil_records (farm_id, nitrogen, phosphorus, potassium, ph, moisture, temperature, humidity, rainfall)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    farm_id, soil_values["nitrogen"], soil_values["phosphorus"],
+                    soil_values["potassium"], soil_values["ph"], soil_values["moisture"],
+                    None, None, None,
+                ),
+            )
+
+            get_db().commit()
+            return redirect(url_for("crop_recommendation"))
+
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        return render_template(
+            "farm_setup.html",
+            farm=farm,
+            soil=soil,
+            default_lat=farm["latitude"] if farm and farm["latitude"] else None,
+            default_lon=farm["longitude"] if farm and farm["longitude"] else None,
+            default_location=farm["location_name"] if farm and farm["location_name"] else "",
+        )
+
+    @app.route("/farm", methods=["GET", "POST"])
+    @login_required
+    def farm_profile():
+        return farm_setup()
+
+    # ==========================================
+    # DASHBOARD & ORCHESTRATED PLANNING
+    # ==========================================
+
+    @app.route("/dashboard")
+    @login_required
+    def dashboard():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            return redirect(url_for("farm_setup"))
+
+        soil = get_latest_soil_record(farm["id"])
+        latest_cycle = get_latest_cycle(farm["id"])
+        weather = get_latest_weather(farm["id"])
+        recommendation = get_latest_recommendation(farm["id"])
+
+        advisories = [dict(r) for r in get_db().execute(
+            "SELECT * FROM advisories WHERE crop_cycle_id IN (SELECT id FROM crop_cycles WHERE farm_id = ?) ORDER BY id DESC LIMIT 5",
+            (farm["id"],),
+        ).fetchall()]
+
+        today = date.today()
+        activity_counts = {"pending": 0, "overdue": 0, "due_today": 0, "completed_week": 0}
+        activities = [dict(row) for row in get_db().execute(
+            "SELECT * FROM farm_activities WHERE farm_id = ? ORDER BY due_date, id DESC LIMIT 8",
+            (farm["id"],),
+        ).fetchall()]
+        for item in activities:
+            item["display_status"] = "OVERDUE" if is_overdue(item, today) else item["status"]
+
+        week_start = (today - timedelta(days=6)).isoformat()
+        count_row = get_db().execute(
+            """SELECT
+                 SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pending,
+                 SUM(CASE WHEN status = 'PENDING' AND due_date < ? THEN 1 ELSE 0 END) AS overdue,
+                 SUM(CASE WHEN status = 'PENDING' AND due_date = ? THEN 1 ELSE 0 END) AS due_today,
+                 SUM(CASE WHEN status = 'COMPLETED' AND substr(completed_at, 1, 10) >= ? THEN 1 ELSE 0 END) AS completed_week
+               FROM farm_activities WHERE farm_id = ?""",
+            (today.isoformat(), today.isoformat(), week_start, farm["id"]),
+        ).fetchone()
+        if count_row:
+            activity_counts = {key: int(count_row[key] or 0) for key in activity_counts}
+
+        farm_analysis = analyze_farm_risk(soil, weather, latest_cycle)
+        crop_stage = latest_cycle["current_stage"] if latest_cycle else "Not started"
+        progress = 0
+        if latest_cycle:
+            stage_summary = get_crop_stage_summary(latest_cycle["crop_name"], latest_cycle["sowing_date"])
+            progress = stage_summary.get("progress", 0)
+            crop_stage = stage_summary.get("current_stage", crop_stage)
+
+        return render_template(
+            "dashboard.html",
+            user=user,
+            farm=farm,
+            soil=soil,
+            latest_cycle=latest_cycle,
+            weather=weather,
+            recommendation=recommendation,
+            advisories=advisories,
+            crop_stage=crop_stage,
+            progress=progress,
+            activities=activities,
+            activity_counts=activity_counts,
+            plan=build_unified_daily_farm_plan(load_farm_state_object(get_db(), farm["id"], user["id"])),
+            condition_score=farm_analysis["condition_score"],
+            condition_components=farm_analysis["condition_components"],
+            risk_level=farm_analysis["risk_level"],
+            risk_scores=farm_analysis["risk_scores"],
+            overall_risk_score=farm_analysis["overall_risk_score"],
+        )
+
+    @app.route("/daily-plan")
+    @login_required
+    def daily_plan_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            flash("Configure your farm profile to view Today's Plan.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        farm_state = load_farm_state_object(get_db(), farm["id"], user["id"])
+        plan = build_unified_daily_farm_plan(farm_state)
+        return render_template("daily_plan.html", plan=plan, farm=farm)
+
+    @app.route("/seven-day-plan")
+    @login_required
+    def seven_day_plan_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            flash("Configure your farm profile to view the 7-day schedule.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        farm_state = load_farm_state_object(get_db(), farm["id"], user["id"])
+        plan_days = build_seven_day_action_plan(farm_state)
+        return render_template("seven_day_plan.html", plan=plan_days, plan_days=plan_days, farm=farm, today=date.today().isoformat())
+
+    # ==========================================
+    # TWO-LEVEL CROP RECOMMENDATION & LIFECYCLE
+    # ==========================================
+
+    @app.route("/crop-recommendation", methods=["GET", "POST"])
+    @login_required
+    def crop_recommendation():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            flash("Please set up your farm profile before running crop planning.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        soil = get_latest_soil_record(farm["id"])
+
+        if request.method == "POST":
+            try:
+                stage_data = validate_crop_inputs(request.form, include_moisture=True)
+            except ValueError as exc:
+                flash(str(exc), "danger")
+                return render_template("crop_recommendation.html", farm=farm, soil=soil)
+
+            try:
+                ml_pred = predict_crop(stage_data)
+                explanation = build_explanation(ml_pred, stage_data)
+            except Exception:
+                current_app.logger.exception("Crop recommendation failed")
+                flash("Crop recommendation is temporarily unavailable. Please try again later.", "warning")
+                return render_template("crop_recommendation.html", farm=farm, soil=stage_data), 503
+
+            get_db().execute(
+                """
+                INSERT INTO soil_records (farm_id, nitrogen, phosphorus, potassium, ph, moisture, temperature, humidity, rainfall)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (farm["id"], stage_data["nitrogen"], stage_data["phosphorus"], stage_data["potassium"], stage_data["ph"], stage_data["moisture"], stage_data["temperature"], stage_data["humidity"], stage_data["rainfall"]),
+            )
+
+            # Insert into crop_recommendations
+            rec_cursor = get_db().execute(
+                """
+                INSERT INTO crop_recommendations (farm_id, recommended_crop, confidence, explanation, input_data)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (farm["id"], ml_pred["recommended_crop"], ml_pred["confidence"], json.dumps(explanation), json.dumps(stage_data)),
+            )
+            get_db().commit()
+
+            return render_template(
+                "recommendation_result.html",
+                result=ml_pred,
+                explanation=explanation,
+                farm=farm,
+                soil=stage_data,
+                recommendation_id=rec_cursor.lastrowid,
+            )
+
+        return render_template("crop_recommendation.html", farm=farm, soil=soil)
+
+    @app.route("/recommendations/<int:recommendation_id>/select", methods=["POST"])
+    @login_required
+    def select_recommendation_crop(recommendation_id):
+        farm = get_user_farm(get_current_user()["id"])
+        selected_crop = (request.form.get("selected_crop") or "").strip()
+        if not farm:
+            flash("Create a farm profile before selecting a crop.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        supported_crops = get_all_supported_crops()
+        from services.suitability_service import get_crop_knowledge
+        aliases = {key.lower(): key for key in supported_crops}
+        aliases.update({info.get("name", key).lower(): key for key, info in get_crop_knowledge().items()})
+        crop_key = aliases.get(selected_crop.lower())
+        if crop_key is None:
+            flash(f"Crop '{selected_crop}' is not in the supported crop taxonomy.", "danger")
+            return redirect(url_for("crop_recommendation"))
+
+        owned = get_db().execute("SELECT id FROM crop_recommendations WHERE id = ? AND farm_id = ?", (recommendation_id, farm["id"])).fetchone()
+        if not owned:
+            return render_template("error.html", message="Recommendation not found."), 404
+        get_db().execute(
+            "UPDATE crop_recommendations SET selected_crop = ? WHERE id = ? AND farm_id = ?",
+            (selected_crop, recommendation_id, farm["id"]),
+        )
+
+        get_db().commit()
+
+        flash(f"{selected_crop} selected. Confirm the actual sowing date to start its lifecycle.", "success")
+        return redirect(url_for("lifecycle_page", crop=selected_crop))
+
+    @app.route("/lifecycle", methods=["GET", "POST"])
+    @login_required
+    def lifecycle_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            flash("Create a farm profile before viewing the crop lifecycle.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        cycle = get_latest_cycle(farm["id"])
+
+        if request.method == "POST":
+            crop_name = (request.form.get("crop_name") or "").strip().lower()
+            sowing_date = (request.form.get("sowing_date") or "").strip()
+            try:
+                if date.fromisoformat(sowing_date) > date.today() or crop_name not in get_all_supported_crops():
+                    raise ValueError
+            except ValueError:
+                flash("Enter a valid sowing date (YYYY-MM-DD).", "danger")
+                return redirect(url_for("lifecycle_page"))
+
+            summary = get_crop_stage_summary(crop_name, sowing_date)
+            get_db().execute(
+                """
+                INSERT INTO crop_cycles (farm_id, crop_name, sowing_date, expected_harvest_date, current_stage, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+                """,
+                (farm["id"], crop_name, sowing_date, summary["expected_harvest_date"], summary["current_stage"]),
+            )
+            get_db().commit()
+            flash(f"Crop lifecycle for {crop_name.title()} started successfully.", "success")
+            return redirect(url_for("lifecycle_page"))
+
+        selected_crop = request.args.get("crop", cycle["crop_name"] if cycle else "wheat")
+        lifecycle_profile = get_lifecycle_profile(selected_crop)
+
+        return render_template(
+            "crop_lifecycle.html",
+            cycle=cycle,
+            farm=farm,
+            lifecycle_profile=lifecycle_profile,
+            all_crops=get_all_supported_crops(),
+            today=date.today().isoformat(),
+            selected_crop=selected_crop,
+        )
+
+    # ==========================================
+    # EXPERT SYSTEM & ADVISORIES
+    # ==========================================
+
+    @app.route("/expert-system")
+    @login_required
+    def expert_system_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        weather_row = get_latest_weather(farm["id"]) if farm else None
+
+        history = [dict(row) for row in get_db().execute(
+            "SELECT activity_type, status, completed_at, title FROM farm_activities WHERE farm_id = ? AND status = 'COMPLETED' ORDER BY completed_at DESC LIMIT 30",
+            (farm["id"] if farm else 0,),
+        ).fetchall()] if farm else []
+
+        stage = cycle.get("current_stage", "Vegetative") if cycle else "Vegetative"
+        crop = cycle.get("crop_name", "General Crop") if cycle else "General Crop"
+        current_weather = {"current": dict(weather_row)} if weather_row else {"current": {}}
+
+        expert_data = evaluate_expert_system(crop, stage, current_weather, soil or {}, [], history)
+
+        return render_template(
+            "expert_system.html",
+            farm=farm,
+            cycle=cycle,
+            soil=soil,
+            weather=weather_row,
+            activity_history=history,
+            expert_data=expert_data,
+            rules=expert_data["advisories"],
+        )
+
+    @app.route("/advisories")
+    @login_required
+    def advisories():
+        farm = get_user_farm(get_current_user()["id"])
+        rows = []
+        if farm:
+            rows = get_db().execute(
+                "SELECT a.* FROM advisories a JOIN crop_cycles c ON c.id = a.crop_cycle_id WHERE c.farm_id = ? ORDER BY a.id DESC",
+                (farm["id"],),
+            ).fetchall()
+        return render_template("advisories.html", advisories=rows, farm=farm)
+
+    @app.route("/advisories/generate", methods=["POST"])
+    @login_required
+    def generate_farm_advisories():
+        farm = get_user_farm(get_current_user()["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+
+        if not farm or not cycle:
+            flash("Set up your farm profile and select an active crop before generating advisories.", "warning")
+            return redirect(url_for("dashboard"))
+
+        weather_data = {"current": {}}
+        if farm.get("latitude") and farm.get("longitude"):
+            try:
+                weather_data = fetch_weather_data(float(farm["latitude"]), float(farm["longitude"]))
+            except Exception:
+                pass
+
+        history = [dict(row) for row in get_db().execute(
+            "SELECT activity_type, status, completed_at, title FROM farm_activities WHERE farm_id = ? AND status = 'COMPLETED' ORDER BY completed_at DESC LIMIT 30",
+            (farm["id"],),
+        ).fetchall()]
+
+        stage = get_crop_stage_summary(cycle["crop_name"], cycle["sowing_date"])["current_stage"]
+        eval_result = evaluate_expert_system(cycle["crop_name"], stage, weather_data, soil or {}, weather_data.get("forecast", []), history)
+        today = date.today().isoformat()
+
+        for adv in eval_result["advisories"]:
+            c = get_db().execute(
+                """
+                INSERT INTO advisories (farm_id, crop_cycle_id, advisory_type, title, message, severity, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (farm["id"], cycle["id"], adv.get("type", "General"), adv.get("title", ""), adv.get("recommendation", adv.get("message", "")), adv.get("severity", "INFO"), adv.get("reason", "")),
+            )
+            # Create pending task if actionable
+            if adv.get("severity") in ["WARNING", "URGENT", "CAUTION"]:
+                if get_db().execute("SELECT id FROM farm_activities WHERE farm_id=? AND crop_cycle_id=? AND title=? AND due_date=?", (farm['id'], cycle['id'], adv.get('title', ''), today)).fetchone():
+                    continue
+                prio = "HIGH" if adv.get("severity") in ["WARNING", "URGENT"] else "MEDIUM"
+                get_db().execute(
+                    """
+                    INSERT INTO farm_activities
+                    (crop_cycle_id, farm_id, advisory_id, activity_type, title, description, reason, crop_stage, recommended_date, due_date, priority, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    """,
+                    (cycle["id"], farm["id"], c.lastrowid, adv.get("type", "General"), adv.get("title", ""), adv.get("recommendation", ""), adv.get("reason", ""), stage, today, today, prio),
+                )
+
+        get_db().commit()
+        flash(f"Generated {len(eval_result['advisories'])} explainable advisories using weather and confirmed activity history.", "success")
+        return redirect(url_for("advisories"))
+
+
+    # ==========================================
+    # FARM ACTIVITIES & CLOSED-LOOP TRACKING
+    # ==========================================
+
+    @app.route("/activities")
+    @login_required
+    def activities_page():
+        farm = get_user_farm(get_current_user()["id"])
+        activities = []
+        if farm:
+            cycle = get_latest_cycle(farm["id"])
+            if cycle:
+                ensure_lifecycle_activities(get_db(), farm["id"], cycle)
+            query = """
+                SELECT a.*, c.crop_name, e.amount AS expense_amount
+                FROM farm_activities a
+                LEFT JOIN crop_cycles c ON c.id = a.crop_cycle_id
+                LEFT JOIN farm_expenses e ON e.activity_id = a.id
+                WHERE a.farm_id = ?
+            """
+            params = [farm["id"]]
+            status_filter = (request.args.get("status") or "").upper()
+            if status_filter == "OVERDUE":
+                query += " AND a.status = 'PENDING' AND a.due_date < ?"
+                params.append(date.today().isoformat())
+            elif status_filter in ["PENDING", "COMPLETED", "SKIPPED"]:
+                query += " AND a.status = ?"
+                params.append(status_filter)
+            for field, column, operator in [('type', 'a.activity_type', '='), ('crop', 'c.crop_name', '='), ('from', 'a.recommended_date', '>='), ('to', 'a.recommended_date', '<=')]:
+                if request.args.get(field):
+                    query += f" AND {column} {operator} ?"
+                    params.append(request.args[field])
+
+            query += " ORDER BY CASE a.status WHEN 'PENDING' THEN 0 ELSE 1 END, a.due_date, a.id DESC"
+            activities = [dict(row) for row in get_db().execute(query, params).fetchall()]
+            for item in activities:
+                item["display_status"] = "OVERDUE" if is_overdue(item) else item["status"]
+
+        return render_template("activities.html", activities=activities, farm=farm, filters=request.args, today=date.today().isoformat())
+
+    @app.route("/activities/create", methods=["POST"])
+    @login_required
+    def create_activity():
+        farm = get_user_farm(get_current_user()["id"])
+        title = (request.form.get("title") or "").strip()
+        activity_type = (request.form.get("activity_type") or "Field inspection").strip()
+        due_date_value = (request.form.get("due_date") or date.today().isoformat()).strip()
+        description = (request.form.get("description") or "").strip()
+        priority = (request.form.get("priority") or "MEDIUM").strip().upper()
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+
+        try:
+            due_date = date.fromisoformat(due_date_value).isoformat()
+        except ValueError:
+            return render_template("error.html", message="Enter a valid activity due date."), 400
+        if not farm or not title:
+            flash("Activity title is required.", "danger")
+            return redirect(url_for("activities_page"))
+        if len(title) > 200:
+            flash("Activity title must be 200 characters or fewer.", "danger")
+            return redirect(url_for("activities_page"))
+        if priority not in {"LOW", "MEDIUM", "HIGH"}:
+            flash("Choose a valid activity priority.", "danger")
+            return redirect(url_for("activities_page"))
+
+        get_db().execute(
+            """
+            INSERT INTO farm_activities
+            (crop_cycle_id, farm_id, activity_type, title, description, reason, crop_stage, recommended_date, due_date, priority, status)
+            VALUES (?, ?, ?, ?, ?, 'Farmer manual task', ?, ?, ?, ?, 'PENDING')
+            """,
+            (cycle["id"] if cycle else None, farm["id"], activity_type, title, description, cycle.get("current_stage") if cycle else None, date.today().isoformat(), due_date, priority),
+        )
+        get_db().commit()
+        flash("Activity created as PENDING. Confirmation will update future AI recommendations.", "success")
+        return redirect(url_for("activities_page"))
+
+    @app.route("/activities/<int:activity_id>/status", methods=["POST"])
+    @login_required
+    def update_activity_status(activity_id):
+        farm = get_user_farm(get_current_user()["id"])
+        activity = get_db().execute(
+            "SELECT id, activity_type, crop_cycle_id, title FROM farm_activities WHERE id = ? AND farm_id = ?",
+            (activity_id, farm["id"] if farm else 0),
+        ).fetchone()
+        if not activity:
+            flash("Activity not found for this farm.", "danger")
+            return redirect(url_for("activities_page"))
+
+        status = (request.form.get("status") or "").upper()
+        note = (request.form.get("farmer_note") or request.form.get("skip_reason") or "").strip()[:1000]
+        if status == 'RESCHEDULED':
+            try:
+                due = date.fromisoformat(request.form.get('rescheduled_date', ''))
+            except ValueError:
+                return render_template('error.html', message='Enter a valid reschedule date.'), 400
+            get_db().execute("UPDATE farm_activities SET status='PENDING', due_date=?, rescheduled_date=?, farmer_note=?, completed_at=NULL, skipped_at=NULL WHERE id=? AND farm_id=?", (due.isoformat(), due.isoformat(), note, activity_id, farm['id']))
+            get_db().commit()
+            flash('Activity rescheduled; it remains unconfirmed.', 'success')
+            return redirect(url_for('activities_page'))
+
+        if status not in {"PENDING", "COMPLETED", "SKIPPED"}:
+            flash("Choose a valid activity status.", "danger")
+            return redirect(url_for("activities_page"))
+
+        amount_spent = None
+        amount_value = (request.form.get("amount_spent") or "").strip()
+        if status == "COMPLETED" and amount_value:
+            try:
+                amount_spent = float(amount_value)
+            except ValueError:
+                return render_template("error.html", message="Enter a valid amount spent for this activity."), 400
+            if not math.isfinite(amount_spent) or amount_spent <= 0:
+                return render_template("error.html", message="Money spent must be a positive finite amount."), 400
+
+        now_str = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        completed_at = now_str if status == "COMPLETED" else None
+        skipped_at = now_str if status == "SKIPPED" else None
+
+        get_db().execute(
+            """
+            UPDATE farm_activities
+            SET status = ?, completed_at = ?, skipped_at = ?, farmer_note = ?, updated_at = ?
+            WHERE id = ? AND farm_id = ?
+            """,
+            (status, completed_at, skipped_at, note, now_str, activity_id, farm["id"]),
+        )
+        if status == "COMPLETED" and amount_spent is not None:
+            activity_type = str(activity["activity_type"]).casefold()
+            category = {
+                "irrigation": "IRRIGATION",
+                "fertilizer": "FERTILIZER",
+                "harvest": "LABOR",
+            }.get(activity_type, "OTHER")
+            expense_date = date.today().isoformat()
+            expense_notes = f"Activity: {activity['title']}"
+            if note:
+                expense_notes = f"{expense_notes}. {note}"
+            get_db().execute(
+                """
+                INSERT INTO farm_expenses
+                    (farm_id, crop_cycle_id, activity_id, category, amount, date, vendor, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO UPDATE SET
+                    crop_cycle_id = excluded.crop_cycle_id,
+                    category = excluded.category,
+                    amount = excluded.amount,
+                    date = excluded.date,
+                    vendor = excluded.vendor,
+                    notes = excluded.notes
+                """,
+                (
+                    farm["id"], activity["crop_cycle_id"], activity_id, category,
+                    amount_spent, expense_date, activity["activity_type"], expense_notes,
+                ),
+            )
+        if status == "COMPLETED" and str(activity["activity_type"]).casefold() == "harvest" and activity["crop_cycle_id"]:
+            get_db().execute("UPDATE crop_cycles SET status = 'harvested' WHERE id = ? AND farm_id = ?", (activity["crop_cycle_id"], farm["id"]))
+
+        get_db().commit()
+        if amount_spent is not None:
+            flash(f"Activity completed and ₹{amount_spent:,.2f} recorded as a farm expense.", "success")
+        else:
+            flash("Activity status recorded. Future advisories use completed actions only.", "success")
+        return redirect(url_for("activities_page"))
+
+
+    # ==========================================
+    # CROP PROBLEM / DISEASE REPORTING & DIAGNOSIS
+    # ==========================================
+
+    @app.route("/report-problem", methods=["GET", "POST"])
+    @login_required
+    def report_problem_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        default_crop = cycle.get("crop_name", "Wheat") if cycle else "Wheat"
+        if not farm:
+            return redirect(url_for("farm_setup"))
+
+        if cycle and request.method == "GET":
+            ensure_lifecycle_activities(get_db(), farm["id"], cycle)
+
+        if request.method == "POST":
+            crop = (request.form.get("crop") or default_crop).strip()
+            plant_part = (request.form.get("plant_part") or "Leaf").strip()
+            category = (request.form.get("problem_category") or "Unknown").strip()
+            symptoms = (request.form.get("symptoms") or "").strip()
+            severity = (request.form.get("severity") or "Moderate").strip()
+            notes = (request.form.get("farmer_notes") or "").strip()
+            try:
+                duration = int(request.form['duration_days']) if request.form.get('duration_days') else None
+                affected_area = float(request.form['affected_area_pct']) if request.form.get('affected_area_pct') else None
+                if not symptoms or (duration is not None and not 1 <= duration <= 100) or (affected_area is not None and not 1 <= affected_area <= 100):
+                    raise ValueError
+            except ValueError:
+                return render_template('error.html', message='Enter symptoms and valid duration or affected area values.'), 400
+
+            saved_filename = None
+            image_bytes = None
+            if "photo" in request.files:
+                file = request.files["photo"]
+                if file and file.filename:
+                    try:
+                        if not allowed_file(file.filename) or file.mimetype not in {'image/jpeg', 'image/png', 'image/webp'}:
+                            raise ValueError
+                        image_bytes = file.read()
+                        if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+                            return render_template("error.html", message="Image exceeds the 5 MiB upload limit."), 413
+                        with Image.open(io.BytesIO(image_bytes)) as uploaded:
+                            if uploaded.format not in {'JPEG', 'PNG', 'WEBP'}:
+                                raise ValueError
+                            if uploaded.width * uploaded.height > 24_000_000:
+                                return render_template("error.html", message="Image dimensions are too large to process."), 400
+                            uploaded.verify()
+                        file.seek(0)
+                    except (ValueError, OSError, UnidentifiedImageError, Image.DecompressionBombError):
+                        return render_template("error.html", message="Upload a valid JPEG, PNG, or WebP image."), 400
+                if file and file.filename and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    unique_name = f"{uuid.uuid4().hex[:12]}_{filename}"
+                    save_path = UPLOAD_FOLDER / unique_name
+                    file.seek(0)
+                    image_bytes = file.read()
+                    UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+                    with open(save_path, "wb") as f_out:
+                        f_out.write(image_bytes)
+                    saved_filename = unique_name
+
+            weather_data = {"current": {}}
+            if farm and farm.get("latitude") and farm.get("longitude"):
+                try:
+                    weather_data = fetch_weather_data(float(farm["latitude"]), float(farm["longitude"]))
+                except Exception:
+                    pass
+
+            diagnosis = analyze_crop_issue(
+                crop_name=crop,
+                plant_part=plant_part,
+                symptoms_text=symptoms,
+                category=category,
+                weather_data=weather_data,
+                image_bytes=image_bytes,
+                image_filename=saved_filename,
+                duration_days=duration,
+                affected_area_pct=affected_area,
+                severity=severity,
+            )
+
+            # Insert report
+            rep_cursor = get_db().execute(
+                """
+                INSERT INTO disease_reports
+                (farm_id, crop_cycle_id, crop, plant_part, problem_category, symptoms, severity, image_path, duration_days, affected_area_pct, farmer_notes, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'REPORTED')
+                """,
+                (farm["id"] if farm else 0, cycle["id"] if cycle else None, crop, plant_part, category, symptoms, severity, saved_filename, duration, affected_area, notes),
+            )
+            report_id = rep_cursor.lastrowid
+
+            # Insert prediction
+            primary = diagnosis.get("primary_diagnosis", {})
+            get_db().execute(
+                """
+                INSERT INTO disease_predictions
+                (report_id, likely_condition, confidence, risk_level, weather_context, recommendations_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (report_id, primary.get("condition", "Undetermined"), primary.get("confidence"), primary.get("risk_level", "MODERATE"), json.dumps(diagnosis.get("image_analysis", {})), json.dumps(diagnosis)),
+            )
+            get_db().commit()
+
+            flash("Symptom report saved. Reference photos are not analyzed.", "success")
+            return redirect(url_for("disease_result_page", report_id=report_id))
+
+        past_reports = get_past_problem_reports(farm["id"] if farm else 0, get_db())
+        return render_template("report_problem.html", farm=farm, default_crop=default_crop, past_reports=past_reports)
+
+    @app.route("/disease-image/<int:report_id>")
+    @login_required
+    def disease_image(report_id):
+        row = get_db().execute("SELECT d.image_path FROM disease_reports d JOIN farms f ON f.id=d.farm_id WHERE d.id=? AND f.user_id=?", (report_id, session['user_id'])).fetchone()
+        if not row or not row['image_path']:
+            return render_template('error.html', message='Image not found.'), 404
+        folder = UPLOAD_FOLDER if (UPLOAD_FOLDER / row['image_path']).exists() else BASE_DIR / 'static' / 'uploads'
+        return send_from_directory(folder, row['image_path'])
+
+    @app.route("/disease-result/<int:report_id>")
+    @login_required
+    def disease_result_page(report_id):
+        farm = get_user_farm(get_current_user()["id"])
+        rep_row = get_db().execute(
+            "SELECT * FROM disease_reports WHERE id = ? AND farm_id = ?",
+            (report_id, farm["id"] if farm else 0),
+        ).fetchone()
+
+        if not rep_row:
+            flash("Diagnostic report not found.", "danger")
+            return redirect(url_for("report_problem_page"))
+
+        pred_row = get_db().execute(
+            "SELECT * FROM disease_predictions WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+
+        diagnosis = json.loads(pred_row["recommendations_json"]) if pred_row and pred_row["recommendations_json"] else {}
+        image_analysis = diagnosis.get("image_analysis")
+        if isinstance(image_analysis, dict):
+            image_analysis.pop("suggestion", None)
+            image_analysis.update(
+                {
+                    "screening_status": "not_requested",
+                    "reason": "problem_report_reference_only",
+                    "message": "Problem Report stores reference photos for later review; no image screening is performed.",
+                    "has_image": bool(rep_row["image_path"]),
+                }
+            )
+        return render_template(
+            "disease_result.html",
+            report=dict(rep_row),
+            diagnosis=diagnosis,
+            farm=farm,
+        )
+
+    # ==========================================
+    # FERTILIZER & NUTRIENT ADVISORY
+    # ==========================================
+
+    @app.route("/fertilizer", methods=["GET", "POST"])
+    @login_required
+    def fertilizer_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        weather = get_latest_weather(farm["id"]) if farm else None
+
+        crop_name = cycle.get("crop_name", "Wheat") if cycle else "Wheat"
+        crop_stage = cycle.get("current_stage", "Vegetative") if cycle else "Vegetative"
+
+        history = [dict(row) for row in get_db().execute(
+            "SELECT activity_type, status, completed_at, title FROM farm_activities WHERE farm_id = ? AND status = 'COMPLETED' ORDER BY completed_at DESC LIMIT 30",
+            (farm["id"] if farm else 0,),
+        ).fetchall()] if farm else []
+
+        weather_dict = {"current": dict(weather)} if weather else {"current": {}}
+        plan = analyze_nutrients_and_advise(crop_name, crop_stage, soil or {}, weather_dict, history)
+
+        return render_template("fertilizer.html", farm=farm, cycle=cycle, soil=soil, plan=plan, nut_info=plan)
+
+    # ==========================================
+    # AGRICULTURAL RESOURCES & DEALERS
+    # ==========================================
+
+    @app.route("/resources")
+    @login_required
+    def resources_page():
+        farm = get_user_farm(get_current_user()["id"])
+        from services.market_service import haversine_distance_km
+        lat = farm.get("latitude") if farm else None
+        lon = farm.get("longitude") if farm else None
+        category = request.args.get("category", "ALL").upper()
+        rows = get_db().execute("SELECT * FROM resources ORDER BY id DESC").fetchall()
+        resources = []
+        for row in rows:
+            item = dict(row)
+            if category != "ALL" and item['category'] != category:
+                continue
+            item['distance_km'] = haversine_distance_km(lat, lon, item['latitude'], item['longitude']) if None not in (lat, lon, item['latitude'], item['longitude']) else None
+            item['items'] = []
+            item['directions_url'] = f"https://www.openstreetmap.org/?mlat={item['latitude']}&mlon={item['longitude']}" if item['latitude'] is not None else "https://www.openstreetmap.org/"
+            resources.append(item)
+        return render_template('resources.html', resources=resources, farm_lat=lat, farm_lon=lon,
+                               active_category=category, total_count=len(resources))
+
+    @app.route("/add-resource", methods=["POST"])
+    @login_required
+    def add_custom_resource():
+        name = request.form.get('name', '').strip()
+        try:
+            lat = float(request.form.get('latitude', ''))
+            lon = float(request.form.get('longitude', ''))
+            if not name or not is_valid_coordinates(lat, lon):
+                raise ValueError
+        except (TypeError, ValueError):
+            return render_template('error.html', message='Provide a resource name and valid coordinates.'), 400
+        get_db().execute("INSERT INTO resources (name, category, seller_name, address, district, state, latitude, longitude, contact_phone, is_seller_listed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (name, request.form.get('category', 'OTHER'), request.form.get('seller_name', ''), request.form.get('address', ''), request.form.get('district', ''), request.form.get('state', ''), lat, lon, request.form.get('contact_phone', '')))
+        get_db().commit()
+        flash('Community listing saved. Availability and prices are not verified.', 'success')
+        return redirect(url_for('resources_page'))
+
+    # ==========================================
+    # MARKET INTELLIGENCE & SELL PLANNER
+    # ==========================================
+
+    @app.route("/market/refresh", methods=["POST"])
+    @login_required
+    def refresh_market_page():
+        from services.official_market_service import refresh_market_data
+        filters = {field: request.form.get(field, "").strip() for field in ("commodity", "state", "district", "market")}
+        filters = {key: value for key, value in filters.items() if value}
+        if "commodity" in filters:
+            filters["commodity"] = filters["commodity"].title()
+        refresh_result = refresh_market_data(filters)
+        flash(refresh_result['message'], 'success' if refresh_result['status'] == 'success' else 'warning' if refresh_result['status'] in {'empty', 'missing_key', 'in_progress', 'cooldown'} else 'danger')
+        return redirect(url_for("market_page", **filters))
+
+    @app.route("/market")
+    @login_required
+    def market_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        commodity = (request.args.get("commodity") or (cycle.get("crop_name") if cycle else "Wheat")).strip()
+
+        lat = float(farm["latitude"]) if farm and farm["latitude"] else None
+        lon = float(farm["longitude"]) if farm and farm["longitude"] else None
+
+        market_data = get_market_prices_for_commodity(commodity, lat, lon, state=request.args.get("state", ""), district=request.args.get("district", ""), market=request.args.get("market", ""))
+        forecast = generate_price_forecast(commodity)
+        commodities = get_all_commodities()
+
+        return render_template(
+            "market.html",
+            commodity=commodity,
+            market_data=market_data,
+            forecast=forecast, forecast_data=forecast, all_commodities=commodities, selected_commodity=commodity,
+            commodities=commodities,
+            farm=farm,
+        )
+
+    @app.route("/sell-planner", methods=["GET", "POST"])
+    @login_required
+    def sell_planner_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        default_crop = cycle.get("crop_name", "Wheat") if cycle else "Wheat"
+
+        commodity = (request.form.get("commodity") or request.args.get("commodity") or default_crop).strip()
+
+        lat = float(farm["latitude"]) if farm and farm["latitude"] else 18.5204
+        lon = float(farm["longitude"]) if farm and farm["longitude"] else 73.8567
+
+        market_data = get_market_prices_for_commodity(commodity, lat, lon)
+        forecast = generate_price_forecast(commodity)
+        markets = market_data.get("markets", [])
+        top_market = max(markets, key=lambda item: item["modal_price"], default=None)
+
+        return render_template(
+            "sell_planner.html",
+            commodity=commodity,
+            forecast=forecast,
+            forecast_info=forecast,
+            market_data=market_data,
+            markets=markets,
+            top_market=top_market,
+            best_market=market_data.get("best_market"),
+            crop_name=commodity,
+            farm=farm,
+            commodities=get_all_commodities(),
+        )
+
+    @app.route("/profit-planner", methods=["GET", "POST"])
+    @login_required
+    def profit_planner_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        default_crop = cycle.get("crop_name", "Wheat") if cycle else "Wheat"
+
+        crop = (request.form.get("crop") or request.args.get("crop") or default_crop).strip()
+        area = float(request.form.get("area") or (farm.get("area", 2.0) if farm else 2.0))
+
+        profit_data = calculate_crop_profit_potential(
+            crop_name=crop,
+            farm_area=area,
+            farm_lat=farm.get("latitude") if farm else None,
+            farm_lon=farm.get("longitude") if farm else None,
+        )
+
+        return render_template(
+            "profit_planner.html",
+            crop=crop,
+            area=area,
+            profit_data=profit_data,
+            all_crops=get_all_supported_crops(), available_crops=get_all_supported_crops(), selected_crop=crop, farm_area=area, area_unit=farm.get("area_unit", "acre") if farm else "acre",
+            farm=farm,
+        )
+
+    # ==========================================
+    # EXPENSES & REALIZED SALES
+    # ==========================================
+
+    @app.route("/expenses")
+    @login_required
+    def expenses_page():
+        farm = get_user_farm(get_current_user()["id"])
+        if not farm:
+            flash("Set up your farm profile to record farm finances.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        expenses = [dict(r) for r in get_db().execute(
+            "SELECT * FROM farm_expenses WHERE farm_id = ? ORDER BY date DESC",
+            (farm["id"],),
+        ).fetchall()]
+
+        sales = [dict(r) for r in get_db().execute(
+            "SELECT * FROM sales WHERE farm_id = ? ORDER BY sale_date DESC",
+            (farm["id"],),
+        ).fetchall()]
+
+        financials = aggregate_farm_financials(expenses, sales)
+
+        return render_template(
+            "expenses.html",
+            expenses=expenses,
+            sales=sales,
+            financials=financials,
+            farm=farm,
+            today=date.today().isoformat(), today_str=date.today().isoformat(),
+        )
+
+    @app.route("/add-expense", methods=["POST"])
+    @login_required
+    def add_expense():
+        farm = get_user_farm(get_current_user()["id"])
+        if not farm:
+            return redirect(url_for("farm_setup"))
+
+        flash("Record money spent by completing a farm activity and entering its cost.", "info")
+        return redirect(url_for("activities_page"))
+
+    @app.route("/add-sale", methods=["POST"])
+    @login_required
+    def add_sale():
+        farm = get_user_farm(get_current_user()["id"])
+        if not farm:
+            return redirect(url_for("farm_setup"))
+
+        crop_name = (request.form.get("commodity") or request.form.get("crop_name") or "Wheat").strip()
+        try:
+            quantity_kg = float(request.form.get("quantity_sold", request.form.get("quantity_kg", "")))
+            price_per_kg = float(request.form.get("price_per_unit", request.form.get("price_per_kg", "")))
+            sale_date = date.fromisoformat((request.form.get("sale_date") or date.today().isoformat()).strip())
+        except (TypeError, ValueError):
+            return render_template('error.html', message='Enter a positive quantity, a valid price, and a valid sale date.'), 400
+        submitted_unit = request.form.get("unit")
+        unit = (submitted_unit or ("kg" if request.form.get("quantity_kg") is not None else "Quintal")).strip()
+        if not crop_name or unit.casefold() not in {"quintal", "qtl", "kg", "ton"}:
+            return render_template('error.html', message='Enter a commodity and choose Quintal, Kg, or Ton as the sale unit.'), 400
+        mandi_name = (request.form.get("market_name") or request.form.get("mandi_name") or "").strip()
+        buyer_type = (request.form.get("buyer_type") or "APMC Mandi").strip()
+        notes = (request.form.get("notes") or "").strip()
+
+        total_rev = quantity_kg * price_per_kg
+        if (not all(math.isfinite(v) for v in (quantity_kg, price_per_kg, total_rev))
+            or quantity_kg <= 0 or price_per_kg <= 0 or sale_date > date.today()):
+            return render_template('error.html', message='Enter positive finite quantity and price values, and a sale date no later than today.'), 400
+        if total_rev > 0:
+            get_db().execute(
+                """
+                INSERT INTO sales (farm_id, commodity, quantity_sold, price_per_unit, total_amount, market_name, sale_date, buyer_name, notes, unit)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (farm["id"], crop_name, quantity_kg, price_per_kg, total_rev, mandi_name, sale_date.isoformat(), buyer_type, notes, unit),
+            )
+            get_db().commit()
+            flash(f"Harvest sale realized! Revenue of ₹{total_rev:,.0f} recorded.", "success")
+        return redirect(url_for("expenses_page"))
+
+    # ==========================================
+    # DATA TRANSPARENCY, NOTIFICATIONS & SETTINGS
+    # ==========================================
+
+    @app.route("/data-transparency")
+    def data_transparency_page():
+        return render_template("data_transparency.html")
+
+    @app.route("/notifications")
+    @login_required
+    def notifications_page():
+        user = get_current_user()
+        notifs = get_user_notifications(user["id"], get_db())
+        return render_template("notifications.html", notifications=notifs)
+
+    @app.route("/notifications/<int:notification_id>/read", methods=["POST"])
+    @login_required
+    def mark_notification_read_route(notification_id):
+        mark_notification_as_read(notification_id, get_db())
+        return redirect(url_for("notifications_page"))
+
+    @app.route("/notifications/mark-all-read", methods=["POST"])
+    @login_required
+    def mark_all_notifications_read():
+        mark_all_notifications_as_read(get_current_user()["id"], get_db())
+        flash("All notifications marked as read.", "info")
+        return redirect(url_for("notifications_page"))
+
+    @app.route("/settings")
+    @login_required
+    def settings_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        return render_template("settings.html", user=user, farm=farm)
+
+    @app.route("/settings/change-password", methods=["POST"])
+    @login_required
+    def change_password():
+        user = get_current_user()
+        current_password = request.form.get('current_password') or ''
+        new_password = request.form.get('new_password') or ''
+        confirm_password = request.form.get('confirm_password') or ''
+
+        if len(current_password) > 128 or not check_password_hash(user['password_hash'], current_password):
+            flash('Current password is incorrect.', 'danger')
+            return redirect(url_for('settings_page'))
+        if not valid_password(new_password):
+            flash('New password must have at least 8 characters including a letter and a number.', 'danger')
+            return redirect(url_for('settings_page'))
+        if new_password != confirm_password:
+            flash('New password and confirmation do not match.', 'danger')
+            return redirect(url_for('settings_page'))
+        if check_password_hash(user['password_hash'], new_password):
+            flash('Choose a password different from your current password.', 'danger')
+            return redirect(url_for('settings_page'))
+
+        auth_token = secrets.token_urlsafe(32)
+        get_db().execute('UPDATE users SET password_hash = ?, auth_token = ? WHERE id = ?',
+                 (generate_password_hash(new_password), auth_token, user['id']))
+        get_db().commit()
+        session.clear()
+        flash('Password changed. Sign in again with your new password.', 'success')
+        return redirect(url_for('login'))
+
+    @app.route("/settings/update-profile", methods=["POST"])
+    @login_required
+    def update_profile():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        name = (request.form.get("name") or user["name"]).strip()
+        risk_pref = (request.form.get("risk_preference") or "Balanced").strip()
+
+        get_db().execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"]))
+        if farm:
+            get_db().execute("UPDATE farms SET risk_preference = ? WHERE id = ?", (risk_pref, farm["id"]))
+        get_db().commit()
+        flash("Profile settings updated successfully.", "success")
+        return redirect(url_for("settings_page"))
+
+    # ==========================================
+    # ADVANCED ANALYTICS, WHAT-IF & DOSSIER REPORT
+    # ==========================================
+
+    @app.route("/history")
+    @login_required
+    def history_page():
+        farm = get_user_farm(get_current_user()["id"])
+        farm_id = farm["id"] if farm else None
+        return render_template("history.html", recommendations=get_db().execute(
+            "SELECT * FROM crop_recommendations WHERE farm_id = ? ORDER BY id DESC", (farm_id,)
+        ).fetchall(), cycles=get_db().execute(
+            "SELECT * FROM crop_cycles WHERE farm_id = ? ORDER BY id DESC", (farm_id,)
+        ).fetchall(), advisories=get_db().execute("SELECT * FROM advisories WHERE farm_id = ? ORDER BY id DESC LIMIT 100", (farm_id,)).fetchall())
+
+    @app.route("/what-if", methods=["GET", "POST"])
+    @login_required
+    def what_if_page():
+        farm = get_user_farm(get_current_user()["id"])
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        result = None
+        values = {}
+
+        if request.method == "POST":
+            try:
+                values = {
+                    "nitrogen": float(request.form.get("nitrogen", (soil or {}).get("nitrogen", 70))),
+                    "phosphorus": float(request.form.get("phosphorus", (soil or {}).get("phosphorus", 40))),
+                    "potassium": float(request.form.get("potassium", (soil or {}).get("potassium", 40))),
+                    "ph": float(request.form.get("ph", (soil or {}).get("ph", 6.5))),
+                    "temperature": float(request.form.get("temperature", 26.0)),
+                    "humidity": float(request.form.get("humidity", 65.0)),
+                    "rainfall": float(request.form.get("rainfall", 120.0)),
+                }
+            except (TypeError, ValueError):
+                flash("Enter valid numeric conditions for simulation.", "warning")
+            else:
+                pred = predict_crop(values)
+                result = {
+                    "prediction": pred,
+                    "dataset_fit": compare_crop_dataset_fit(values)[:3],
+                    "explanation": build_explanation(pred, values),
+                }
+
+        return render_template("what_if.html", values=values or soil or {}, result=result)
+
+    @app.route("/compare-crops", methods=["GET", "POST"])
+    @login_required
+    def compare_crops_page():
+        crops = get_all_supported_crops()
+        farm = get_user_farm(get_current_user()["id"])
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        results = []
+        values = {}
+
+        if request.method == "POST":
+            selected = request.form.getlist("crop")
+            try:
+                values = {
+                    "nitrogen": float(request.form.get("nitrogen", (soil or {}).get("nitrogen", 70))),
+                    "phosphorus": float(request.form.get("phosphorus", (soil or {}).get("phosphorus", 40))),
+                    "potassium": float(request.form.get("potassium", (soil or {}).get("potassium", 40))),
+                    "ph": float(request.form.get("ph", (soil or {}).get("ph", 6.5))),
+                    "temperature": float(request.form.get("temperature", 26.0)),
+                    "humidity": float(request.form.get("humidity", 65.0)),
+                    "rainfall": float(request.form.get("rainfall", 120.0)),
+                }
+            except (TypeError, ValueError):
+                flash("Enter all 7 numeric conditions before comparing crops.", "warning")
+            else:
+                if not 2 <= len(selected) <= 3:
+                    flash("Select 2 or 3 crops to compare.", "warning")
+                else:
+                    results = compare_crop_dataset_fit(values, selected)
+
+        return render_template("compare_crops.html", crops=crops, results=results, values=values or soil or {})
+
+    @app.route("/ml-analytics")
+    @login_required
+    def ml_analytics_page():
+        metrics = get_model_evaluation_metrics()
+        return render_template("ml_analytics.html", metrics=metrics)
+
+    @app.route("/risk-analysis")
+    @login_required
+    def risk_analysis_page():
+        farm = get_user_farm(get_current_user()["id"])
+        soil = get_latest_soil_record(farm["id"]) if farm else None
+        weather = get_latest_weather(farm["id"]) if farm else None
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+        analysis = analyze_farm_risk(soil, weather, cycle)
+        return render_template("risk_analysis.html", farm=farm, soil=soil, weather=weather, cycle=cycle, analysis=analysis)
+
+    @app.route("/weather")
+    @login_required
+    def weather_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        weather = None
+        cycle = get_latest_cycle(farm["id"]) if farm else None
+
+        if farm and farm.get("latitude") and farm.get("longitude"):
+            try:
+                weather = fetch_weather_data(float(farm["latitude"]), float(farm["longitude"]))
+                current = weather["current"]
+                get_db().execute(
+                    """
+                    INSERT INTO weather_records (farm_id, temperature, humidity, precipitation, rain_probability, wind_speed, forecast_date, raw_payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (farm["id"], current.get("temperature"), current.get("humidity"), current.get("precipitation"), current.get("rain_probability"), current.get("wind_speed"), date.today().isoformat(), json.dumps(weather)),
+                )
+                get_db().commit()
+            except Exception:
+                cached = get_latest_weather(farm['id'])
+                if cached and cached.get('raw_payload'):
+                    weather = json.loads(cached['raw_payload'])
+                    weather['is_stale'] = True
+                    weather['is_cached'] = True
+                else:
+                    weather = None
+
+        weather_analysis = analyze_forecast(weather.get("forecast", []) if weather else [], cycle.get("crop_name", "") if cycle else "", cycle.get("current_stage", "") if cycle else "")
+        return render_template("weather.html", farm=farm, weather=weather, weather_analysis=weather_analysis, today=date.today().isoformat())
+
+    @app.route("/report")
+    @login_required
+    def farm_report_page():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            flash("Set up your farm profile to view the Farm Dossier Report.", "warning")
+            return redirect(url_for("farm_setup"))
+
+        dossier = generate_comprehensive_farm_report(
+            farmer=user,
+            farm=farm,
+            soil=get_latest_soil_record(farm["id"]) or {},
+            crop_cycle=get_latest_cycle(farm["id"]),
+            weather=get_latest_weather(farm["id"]) or {},
+            activities=[dict(r) for r in get_db().execute("SELECT * FROM farm_activities WHERE farm_id = ? ORDER BY due_date ASC", (farm["id"],)).fetchall()],
+            disease_reports=[dict(r) for r in get_db().execute("SELECT * FROM disease_reports WHERE farm_id = ? ORDER BY id DESC", (farm["id"],)).fetchall()],
+            expenses=[dict(r) for r in get_db().execute("SELECT * FROM farm_expenses WHERE farm_id = ? ORDER BY date DESC", (farm["id"],)).fetchall()],
+            sales=[dict(r) for r in get_db().execute("SELECT * FROM sales WHERE farm_id = ? ORDER BY sale_date DESC", (farm["id"],)).fetchall()],
+        )
+
+        return render_template(
+            "farm_report.html",
+            farm=farm,
+            dossier=dossier,
+            soil=get_latest_soil_record(farm["id"]),
+            cycle=get_latest_cycle(farm["id"]),
+            weather=get_latest_weather(farm["id"]),
+            activities=dossier.get("activities", []),
+            recommendation=get_latest_recommendation(farm["id"]),
+            lifecycle=dossier.get("lifecycle", {}),
+            forecast_days=[],
+            advisories=dossier.get("expert_advisories", []),
+            risk=dossier.get("risk", {}),
+        )
+
+    @app.route("/research")
+    def research_page():
+        return render_template("research.html", metrics=get_model_evaluation_metrics())
+
+    # ==========================================
+    # JSON APIs
+    # ==========================================
+
+    @app.route("/api/reverse-geocode", methods=["POST"])
+    @login_required
+    def api_reverse_geocode():
+        data = request.get_json(silent=True) or {}
+        lat = data.get("latitude")
+        lon = data.get("longitude")
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+            if not is_valid_coordinates(lat_f, lon_f):
+                return jsonify({"success": False, "message": "Coordinates out of bounds."}), 400
+            loc = reverse_geocode(lat_f, lon_f)
+            return jsonify({"success": True, "location": loc})
+        except ValueError as exc:
+            # ValueError messages are our own validation wording and are safe to show.
+            return jsonify({"success": False, "message": str(exc)}), 400
+        except Exception:
+            # Never echo an unexpected internal exception to the client.
+            current_app.logger.exception("Reverse geocoding failed")
+            return jsonify({"success": False, "message": "Location lookup is temporarily unavailable. Enter the location manually."}), 502
+
+    @app.route("/api/location", methods=["POST"])
+    @login_required
+    def api_location():
+        payload = request.get_json(silent=True) or {}
+        lat = payload.get("latitude")
+        lon = payload.get("longitude")
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            return jsonify({"success": False, "message": "Create a farm before storing coordinates."}), 400
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+            if not is_valid_coordinates(lat_f, lon_f):
+                raise ValueError
+        except Exception:
+            return jsonify({"success": False, "message": "Invalid coordinates."}), 400
+
+        get_db().execute("UPDATE farms SET latitude = ?, longitude = ? WHERE id = ?", (lat_f, lon_f, farm["id"]))
+        get_db().commit()
+        return jsonify({"success": True, "latitude": lat_f, "longitude": lon_f})
+
+    @app.route("/api/weather")
+    @login_required
+    def api_weather():
+        user = get_current_user()
+        farm = get_user_farm(user["id"])
+        if not farm:
+            return jsonify({"success": False, "message": "No farm profile found."}), 400
+        lat = farm.get("latitude")
+        lon = farm.get("longitude")
+        if lat is None or lon is None:
+            return jsonify({"success": False, "message": "Set farm coordinates first."}), 400
+        try:
+            w_data = fetch_weather_data(float(lat), float(lon))
+            return jsonify({"success": True, "weather": w_data})
+        except Exception as exc:
+            # Only deliberately user-facing errors are echoed; anything unexpected is
+            # logged server-side and replaced with a generic message so internal
+            # exception text (paths, library versions, upstream details) never leaks.
+            current_app.logger.exception("Weather API failed")
+            message = str(exc) if isinstance(exc, WeatherError) else "Weather is temporarily unavailable. Try again later."
+            return jsonify({"success": False, "message": message}), 400
+
+    @app.route("/api/recommend-crop", methods=["POST"])
+    @login_required
+    def api_recommend_crop():
+        data = request.get_json(silent=True) or {}
+        try:
+            values = validate_crop_inputs(data)
+        except ValueError as exc:
+            return jsonify({"success": False, "message": str(exc)}), 400
+        try:
+            result = predict_crop(values)
+            explanation = build_explanation(result, values)
+        except Exception:
+            current_app.logger.exception("Crop recommendation API failed")
+            return jsonify({"success": False, "message": "Crop recommendation is temporarily unavailable."}), 503
+        return jsonify({"success": True, "result": result, "explanation": explanation})
+
+    # ==========================================
+    # ERROR HANDLERS
+    # ==========================================
+
+    @app.errorhandler(404)
+    def handle_404(_):
+        return render_template("error.html", message="The requested page could not be found."), 404
+
+    @app.errorhandler(500)
+    def handle_500(_):
+        return render_template("error.html", message="An unexpected server error occurred."), 500
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=5000)

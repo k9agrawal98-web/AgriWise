@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block title %}Sell Planner — AgriWise AI{% endblock %}
+
+{% block content %}
+<div class="container-fluid px-0">
+  <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+    <div>
+      <h2 class="h3 fw-bold mb-1"><i class="fa-solid fa-scale-balanced text-primary me-2"></i>Market Observations</h2>
+      <p class="text-muted small mb-0">Compare retrieved mandi spot observations. These are not guaranteed sale offers or transport-adjusted returns.</p>
+    </div>
+    <a href="{{ url_for('market_page', commodity=commodity) }}" class="btn btn-outline-success btn-sm">
+      <i class="fa-solid fa-shop me-1"></i>Market details
+    </a>
+  </div>
+
+  <div class="card shadow-sm border-0 mb-4">
+    <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <h5 class="mb-0 fw-bold">{{ commodity|title }} mandi prices</h5>
+      <span class="badge bg-light text-dark border">Data status: {{ market_data.refresh_status|default('unavailable')|title }}</span>
+    </div>
+    <div class="card-body">
+      <p class="small text-muted mb-3">
+        Source: {{ market_data.source|default('data.gov.in / DMI') }}.
+        {% if market_data.fetch_timestamp %}Retrieved {{ market_data.fetch_timestamp }}.{% endif %}
+        {% if market_data.is_stale %} Cached observations are stale; confirm prices with the market before acting.{% endif %}
+      </p>
+      {% if markets %}
+        {% if top_market %}
+          <div class="alert alert-info py-2 small">
+            Highest modal price in this returned sample: <strong>{{ top_market.market_name }}</strong>,
+            ₹{{ top_market.modal_price }} per quintal on {{ top_market.price_date }}.
+            This is a spot observation only; it is not a market recommendation.
+          </div>
+        {% endif %}
+        <div class="table-responsive">
+          <table class="table table-hover align-middle">
+            <thead class="table-light">
+              <tr><th>Market</th><th>District / State</th><th>Observation date</th><th>Min (₹/qtl)</th><th>Modal (₹/qtl)</th><th>Max (₹/qtl)</th></tr>
+            </thead>
+            <tbody>
+              {% for market in markets %}
+                <tr>
+                  <td>{{ market.market_name }}</td>
+                  <td>{{ market.district }}, {{ market.state }}</td>
+                  <td>{{ market.price_date }}{% if market.is_stale %} <span class="badge bg-warning text-dark">Stale</span>{% endif %}</td>
+                  <td>{{ market.min_price }}</td><td class="fw-semibold">{{ market.modal_price }}</td><td>{{ market.max_price }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="alert alert-secondary mb-0">
+          {{ market_data.message|default('No market observations are currently available for this commodity.') }}
+          {% if market_data.refresh_status == 'unavailable' %} Configure the official data provider and refresh to retrieve real observations.{% endif %}
+        </div>
+      {% endif %}
+      <p class="small text-muted mb-0 mt-3">The returned data does not provide verified market coordinates or transport-cost inputs, so this page does not rank destinations by estimated net return.</p>
+    </div>
+  </div>
+
+  <div class="card shadow-sm border-0">
+    <div class="card-header bg-white py-3">
+      <h5 class="mb-0 fw-bold"><i class="fa-solid fa-chart-line text-primary me-2"></i>Price forecast</h5>
+    </div>
+    <div class="card-body">
+      {% if forecast_info and forecast_info.forecast_generated %}
+        <p>Projected modal price: ₹{{ forecast_info.forecasted_modal_price }} per quintal over {{ forecast_info.forecast_horizon_days }} days.</p>
+        <p class="small text-muted">History: {{ forecast_info.observation_count }} observations from {{ forecast_info.market_name }}. {{ forecast_info.confidence }}. {{ forecast_info.disclaimer }}</p>
+        <p class="small mb-0">Held-out MAE: ₹{{ forecast_info.evaluation_metrics.mae }}; RMSE: ₹{{ forecast_info.evaluation_metrics.rmse }} per quintal.</p>
+      {% else %}
+        <p class="mb-0">{{ forecast_info.message|default('Forecast unavailable: validated historical observations are not available.') }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

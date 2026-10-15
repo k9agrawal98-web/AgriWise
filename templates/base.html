@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="{{ current_language|default('en') }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}AgriWise AI — Intelligent Farming Decision Platform{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/favicon.svg') }}">
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,600&display=swap" rel="stylesheet">
+    
+    <!-- Bootstrap 5.3.3 & Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+    
+    <!-- Leaflet CSS for Maps -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <!-- Custom AgriWise Styles -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/product.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/framer-motion@11.11.11/dist/framer-motion.js"></script>
+    {% block head %}{% endblock %}
+  </head>
+  <body class="{% block body_class %}{% endblock %}">
+    <!-- Keyboard users can bypass repeated navigation. -->
+    <a class="skip-link" href="#main-content">{{ t('common.skip_to_main') }}</a>
+    <div class="site-atmosphere" data-farm-scene="ambient" data-scene-state="loading" aria-hidden="true"><canvas></canvas></div>
+    <!-- Top Navigation Bar -->
+    <header class="app-navbar{% if not session.get('user_id') %} app-navbar--guest{% endif %}">
+      <div class="app-navbar__brand d-flex align-items-center">
+        {% if session.get('user_id') %}
+          <button class="btn btn-sm btn-outline-secondary d-lg-none me-2" id="sidebarToggle" type="button">
+            <i class="fa-solid fa-bars"></i>
+          </button>
+        {% endif %}
+        <a class="text-decoration-none d-flex align-items-center" href="{{ url_for('index') }}" aria-label="AgriWise AI">
+          <div class="brand-badge"><i class="fa-solid fa-seedling"></i></div>
+          <div>
+            <span class="fs-5 fw-bold text-dark font-sans tracking-tight">AgriWise<span class="text-success">AI</span></span>
+            <span class="badge bg-light text-success border border-success-subtle ms-2 d-none d-sm-inline-block font-sans" style="font-size:0.65rem;">{{ t('common.brand_tagline') }}</span>
+          </div>
+        </a>
+      </div>
+
+      <!-- Center location badge if farm exists -->
+      {% if g.current_farm %}
+        <div class="app-navbar__location d-none d-md-flex align-items-center px-3 py-1 bg-light rounded-pill border border-secondary-subtle small text-secondary">
+          <i class="fa-solid fa-location-dot text-success me-2"></i>
+          <span class="app-navbar__farm-name fw-semibold text-dark me-1">{{ g.current_farm.farm_name }}</span>
+          <span class="app-navbar__farm-location">({{ g.current_farm.location_name or t('common.location_not_set') }})</span>
+        </div>
+      {% endif %}
+
+      <!-- Right Profile & Notifications -->
+      <div class="app-navbar__actions d-flex align-items-center gap-2">
+        <form method="POST" action="{{ url_for('set_language') }}" class="app-language-form d-flex align-items-center gap-1">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="next" value="{{ request.path }}">
+          <label for="app-language" class="visually-hidden">{{ t('language.label') }}</label>
+          <select id="app-language" name="language" class="form-select form-select-sm" aria-label="{{ t('language.label') }}">
+            <option value="en" {% if current_language == 'en' %}selected{% endif %}>{{ t('language.english') }}</option>
+            <option value="mr" {% if current_language == 'mr' %}selected{% endif %}>{{ t('language.marathi') }}</option>
+            <option value="hi" {% if current_language == 'hi' %}selected{% endif %}>{{ t('language.hindi') }}</option>
+          </select>
+          <button class="btn btn-sm btn-outline-success" type="submit">{{ t('language.save') }}</button>
+        </form>
+        {% if session.get('user_id') %}
+          <a href="{{ url_for('notifications_page') }}" class="btn btn-light position-relative rounded-circle p-2 text-secondary" title="{{ t('nav.notifications') }}" aria-label="{{ t('nav.notifications') }}">
+            <i class="fa-regular fa-bell" aria-hidden="true"></i>
+            {% if g.unread_notifications and g.unread_notifications > 0 %}
+              <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="font-size:0.65rem;">
+                {{ g.unread_notifications }}
+              </span>
+            {% endif %}
+          </a>
+          <div class="dropdown">
+            <button class="btn btn-light dropdown-toggle d-flex align-items-center gap-2 border" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+              <i class="fa-regular fa-circle-user text-success fs-5"></i>
+              <span class="d-none d-sm-inline font-sans fw-medium small">{{ g.current_user.name if g.current_user else t('common.farmer') }}</span>
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end shadow-sm">
+              <li><h6 class="dropdown-header">{{ g.current_user.email if g.current_user else '' }}</h6></li>
+              <li><a class="dropdown-item" href="{{ url_for('farm_profile') }}"><i class="fa-solid fa-tractor me-2 text-muted"></i>{{ t('nav.farm_setup') }}</a></li>
+              <li><a class="dropdown-item" href="{{ url_for('settings_page') }}"><i class="fa-solid fa-gear me-2 text-muted"></i>{{ t('common.settings') }}</a></li>
+              <li><hr class="dropdown-divider"></li>
+              <li><form method="POST" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="dropdown-item text-danger" type="submit"><i class="fa-solid fa-right-from-bracket me-2"></i>{{ t('nav.logout') }}</button></form></li>
+            </ul>
+          </div>
+        {% else %}
+          <a href="{{ url_for('login') }}" class="btn btn-sm btn-outline-success fw-medium">{{ t('nav.farmer_login') }}</a>
+          <a href="{{ url_for('register') }}" class="btn btn-sm btn-success fw-medium">{{ t('nav.create_account') }}</a>
+        {% endif %}
+      </div>
+    </header>
+
+    <!-- App Wrapper -->
+    <div class="app-wrapper">
+      {% if session.get('user_id') %}
+        <!-- Left Sidebar Navigation -->
+        <aside class="app-sidebar" id="appSidebar">
+          <div class="sidebar-nav">
+            
+            <a class="sidebar-link {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"><i class="fa-solid fa-gauge-high"></i> {{ t('nav.dashboard') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'farm_profile' %}active{% endif %}" href="{{ url_for('farm_profile') }}"><i class="fa-solid fa-tractor"></i> {{ t('nav.farm_setup') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'crop_recommendation' %}active{% endif %}" href="{{ url_for('crop_recommendation') }}"><i class="fa-solid fa-seedling"></i> {{ t('nav.crop_recommendation') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'lifecycle_page' %}active{% endif %}" href="{{ url_for('lifecycle_page') }}"><i class="fa-solid fa-calendar"></i> {{ t('nav.lifecycle') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'activities_page' %}active{% endif %}" href="{{ url_for('activities_page') }}"><i class="fa-solid fa-list-check"></i> {{ t('nav.activities') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'expenses_page' %}active{% endif %}" href="{{ url_for('expenses_page') }}"><i class="fa-solid fa-wallet"></i> {{ t('nav.expenses') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'weather_page' %}active{% endif %}" href="{{ url_for('weather_page') }}"><i class="fa-solid fa-cloud-sun"></i> {{ t('nav.weather') }}</a>
+            <a class="sidebar-link {% if request.endpoint == 'report_problem_page' %}active{% endif %}" href="{{ url_for('report_problem_page') }}"><i class="fa-solid fa-clipboard"></i> {{ t('nav.problem_report') }}</a>
+            <form method="POST" action="{{ url_for('logout') }}" class="m-0"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="sidebar-link w-100 border-0 bg-transparent text-start" type="submit"><i class="fa-solid fa-right-from-bracket"></i> {{ t('nav.logout') }}</button></form>
+
+          </div>
+        </aside>
+      {% endif %}
+
+      <!-- Main Content Container -->
+      <main class="app-content" id="main-content" tabindex="-1">
+        <!-- Toast / Flash Messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="no-print mb-3" role="status" aria-live="polite">
+              {% for category, message in messages %}
+                <div class="alert alert-{{ 'danger' if category == 'error' else category }} alert-dismissible fade show shadow-sm" role="{{ 'alert' if category in ('danger', 'error') else 'status' }}">
+                  <div class="d-flex align-items-center">
+                    <i class="fa-solid {{ 'fa-triangle-exclamation' if category in ('danger', 'error') else 'fa-circle-info' }} me-2" aria-hidden="true"></i>
+                    <div>{{ message }}</div>
+                  </div>
+                  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+      // Sidebar toggle for mobile devices
+      const sidebarToggle = document.getElementById('sidebarToggle');
+      const appSidebar = document.getElementById('appSidebar');
+      if (sidebarToggle && appSidebar) {
+        sidebarToggle.addEventListener('click', () => {
+          appSidebar.classList.toggle('show');
+        });
+      }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/framer-motion@11.11.11/dist/framer-motion.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', function () {
+        const motionLib = window.motion || window.framerMotion;
+        if (!motionLib || typeof motionLib.animate !== 'function') {
+          return;
+        }
+
+        document.querySelectorAll('[data-motion]').forEach(function (element, index) {
+          let config = {};
+          try {
+            config = element.dataset.motion ? JSON.parse(element.dataset.motion) : {};
+          } catch (error) {
+            config = {};
+          }
+
+          const keyframes = config.keyframes || { opacity: [0, 1], y: [24, 0], scale: [0.98, 1] };
+          const duration = Number(config.duration) || 0.7;
+          const delay = Number(config.delay) || index * 0.08;
+          const ease = config.ease || 'easeOut';
+
+          motionLib.animate(element, keyframes, {
+            duration,
+            delay,
+            ease,
+          });
+
+          if (config.hover) {
+            const hoverConfig = config.hover;
+            element.addEventListener('mouseenter', function () {
+              motionLib.animate(element, hoverConfig.to || { y: -4, scale: 1.02 }, {
+                duration: Number(hoverConfig.duration) || 0.2,
+                ease: hoverConfig.ease || 'easeOut',
+              });
+            });
+
+            element.addEventListener('mouseleave', function () {
+              motionLib.animate(element, hoverConfig.from || { y: 0, scale: 1 }, {
+                duration: Number(hoverConfig.duration) || 0.2,
+                ease: hoverConfig.ease || 'easeOut',
+              });
+            });
+          }
+        });
+      });
+    </script>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/farm-scene.js') }}"></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

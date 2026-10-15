@@ -1,0 +1,59 @@
+{% extends 'base.html' %}
+{% block title %}Crop Model Evaluation — AgriWise AI{% endblock %}
+{% block content %}
+<div class="container-fluid px-0">
+  <header class="mb-4">
+    <span class="badge bg-primary-subtle text-primary px-3 py-1 rounded-pill mb-2">Model evaluation</span>
+    <h1 class="h3 fw-bold">Crop Classification ML Analytics</h1>
+    <p class="text-muted">Reproducible local benchmark. Scores do not establish field or regional accuracy.</p>
+  </header>
+
+  {% if metrics %}
+  {% set selected = metrics.selected_holdout_metrics %}
+  {% set baseline = metrics.baseline_holdout_metrics %}
+  <div class="row g-3 mb-4">
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-body"><small class="text-muted">DATASET ROWS</small><h3>{{ metrics.dataset_size }}</h3><span>{{ metrics.crop_classes|length }} classes · {{ metrics.features|length }} features</span></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-body"><small class="text-muted">TRAIN / FINAL HOLDOUT</small><h3>{{ metrics.training_samples }} / {{ metrics.test_samples }}</h3><span>Grouped stratified split · seed {{ metrics.random_seed }}</span></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-body"><small class="text-muted">SELECTED MODEL</small><h3 class="h5">{{ metrics.best_model }}</h3><span>Training CV macro-F1: {{ '%.4f'|format(metrics.best_cv_macro_f1) }}</span></div></div></div>
+    <div class="col-sm-6 col-xl-3"><div class="card h-100"><div class="card-body"><small class="text-muted">FINAL HOLDOUT</small><h3>{{ '%.2f'|format(selected.accuracy * 100) }}% accuracy</h3><span>Macro-F1 {{ '%.4f'|format(selected.macro_f1) }} · 95% CI {{ '%.2f'|format(selected.accuracy_95ci[0] * 100) }}–{{ '%.2f'|format(selected.accuracy_95ci[1] * 100) }}%</span></div></div></div>
+  </div>
+
+  <section class="content-section mb-4">
+    <h2 class="h5">Final holdout: selected model and baseline</h2>
+    <p>The selected model was chosen by five-fold macro-F1 on training data only. The reserved holdout was evaluated once.</p>
+    <div class="table-responsive"><table class="table table-sm">
+      <thead><tr><th>Model</th><th>Accuracy</th><th>Macro precision</th><th>Macro recall</th><th>Macro F1</th></tr></thead>
+      <tbody>
+        <tr><th>{{ metrics.best_model }} (selected)</th><td>{{ '%.4f'|format(selected.accuracy) }}</td><td>{{ '%.4f'|format(selected.macro_precision) }}</td><td>{{ '%.4f'|format(selected.macro_recall) }}</td><td>{{ '%.4f'|format(selected.macro_f1) }}</td></tr>
+        <tr><th>Fixed Random Forest baseline</th><td>{{ '%.4f'|format(baseline.accuracy) }}</td><td>{{ '%.4f'|format(baseline.macro_precision) }}</td><td>{{ '%.4f'|format(baseline.macro_recall) }}</td><td>{{ '%.4f'|format(baseline.macro_f1) }}</td></tr>
+      </tbody>
+    </table></div>
+    <p class="small mb-0">No measured gain over the baseline was demonstrated. Candidate-level CV scores below are for model selection; candidates not selected were not evaluated on the final holdout.</p>
+  </section>
+
+  <section class="content-section mb-4">
+    <h2 class="h5">Training-only model selection</h2>
+    <div class="table-responsive"><table class="table table-sm">
+      <thead><tr><th>Candidate</th><th>CV macro-F1 mean</th><th>Selected</th></tr></thead>
+      <tbody>{% for row in metrics.models_evaluated %}<tr><td>{{ row.model_name }}</td><td>{{ '%.4f'|format(row.cv_macro_f1_mean) }}</td><td>{{ 'Yes' if row.model_name == metrics.best_model else 'No' }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </section>
+
+  <section class="content-section mb-4">
+    <h2 class="h5">Confusion matrix</h2>
+    <img src="{{ url_for('static', filename='img/confusion_matrix.png') }}" alt="Final holdout confusion matrix" class="img-fluid rounded border">
+  </section>
+
+  <section class="content-section mb-4">
+    <h2 class="h5">Dataset checks and inputs</h2>
+    <p>Input features: N, P, K, temperature, humidity, pH, rainfall. Units, source and collection context are unresolved.</p>
+    <ul><li>{{ metrics.data_quality_summary.total_rows }} valid rows; {{ metrics.data_quality_summary.classes_count }} crop classes.</li><li>{{ metrics.data_quality_summary.exact_duplicate_rows }} exact duplicate rows; {{ metrics.data_quality_summary.duplicate_feature_rows }} repeated feature rows; {{ metrics.data_quality_summary.conflicting_feature_label_groups }} feature groups with conflicting crop labels.</li><li>Region and soil moisture are not model inputs.</li></ul>
+    <div class="d-flex flex-wrap gap-1">{% for crop in metrics.crop_classes %}<span class="badge bg-light text-dark border">{{ crop|title }}</span>{% endfor %}</div>
+  </section>
+
+  <p class="small text-muted">Classifier probabilities are uncalibrated and are not probabilities of harvest success or farm suitability. Dataset provenance, license, units and independence are unverified. <a href="{{ url_for('research_page') }}">Read the project research notes</a>.</p>
+  {% else %}
+  <p>Model evaluation metrics are unavailable. Train with <code>python ml/train_model.py</code>.</p>
+  {% endif %}
+</div>
+{% endblock %}

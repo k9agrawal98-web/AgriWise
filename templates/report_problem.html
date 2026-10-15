@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+
+{% block title %}{{ t('report.title') }} — AgriWise AI{% endblock %}
+
+{% block content %}
+<div class="container-fluid px-0" style="max-width: 860px;">
+  <div class="mb-4">
+    <h2 class="h3 fw-bold mb-1"><i class="fa-solid fa-bug text-danger me-2"></i>{{ t('report.title') }}</h2>
+    <p class="text-muted small mb-0">{{ t('report.subtitle') }}</p>
+  </div>
+
+  <div class="card shadow-sm border-0 mb-4">
+    <div class="card-header bg-white py-3">
+      <h5 class="mb-0 fw-bold"><i class="fa-solid fa-clipboard-question text-success me-2"></i>{{ t('report.field_symptom_intake') }}</h5>
+    </div>
+    <div class="card-body p-4">
+      <form method="POST" action="{{ url_for('report_problem_page') }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label small fw-semibold">{{ t('report.affected_crop') }} <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" name="crop" value="{{ default_crop }}" placeholder="{{ t('report.crop_placeholder') }}" required>
+          </div>
+
+          <div class="col-md-6">
+            <label class="form-label small fw-semibold">{{ t('report.plant_part') }} <span class="text-danger">*</span></label>
+            <select class="form-select" name="plant_part" required>
+              <option value="Leaf" selected>{{ t('report.part_leaf') }}</option>
+              <option value="Stem">{{ t('report.part_stem') }}</option>
+              <option value="Root">{{ t('report.part_root') }}</option>
+              <option value="Flower">{{ t('report.part_flower') }}</option>
+              <option value="Fruit">{{ t('report.part_fruit') }}</option>
+              <option value="Whole Plant">{{ t('report.part_whole_plant') }}</option>
+            </select>
+          </div>
+
+          <div class="col-md-6">
+            <label class="form-label small fw-semibold">{{ t('report.problem_category') }}</label>
+            <select class="form-select" name="problem_category">
+              <option value="Unknown" selected>{{ t('report.category_unknown') }}</option>
+              <option value="Fungal">{{ t('report.category_fungal') }}</option>
+              <option value="Bacterial">{{ t('report.category_bacterial') }}</option>
+              <option value="Viral">{{ t('report.category_viral') }}</option>
+              <option value="Pest">{{ t('report.category_pest') }}</option>
+              <option value="Nutrient">{{ t('report.category_nutrient') }}</option>
+              <option value="Weather">{{ t('report.category_weather') }}</option>
+            </select>
+          </div>
+
+          <div class="col-md-3 col-6">
+            <label class="form-label small fw-semibold">{{ t('report.duration_days') }}</label>
+            <input type="number" min="1" max="100" class="form-control" name="duration_days" >
+          </div>
+
+          <div class="col-md-3 col-6">
+            <label class="form-label small fw-semibold">{{ t('report.affected_area') }}</label>
+            <input type="number" min="1" max="100" class="form-control" name="affected_area_pct" >
+          </div>
+
+          <div class="col-md-12">
+            <label class="form-label small fw-semibold">{{ t('report.detailed_symptoms') }} <span class="text-danger">*</span></label>
+            <textarea class="form-control" name="symptoms" rows="3" placeholder="{{ t('report.symptoms_placeholder') }}" required></textarea>
+          </div>
+
+          <div class="col-md-6">
+            <label class="form-label small fw-semibold">{{ t('report.severity_estimate') }}</label>
+            <select class="form-select" name="severity">
+              <option value="Mild">{{ t('report.severity_mild') }}</option>
+              <option value="Moderate" selected>{{ t('report.severity_moderate') }}</option>
+              <option value="Severe">{{ t('report.severity_severe') }}</option>
+            </select>
+          </div>
+
+          <div class="col-md-6">
+            <label class="form-label small fw-semibold">{{ t('report.reference_photo') }} <span class="text-muted">({{ t('report.photo_limit') }})</span></label>
+            <input type="file" class="form-control" name="photo" accept=".jpg,.jpeg,.png,.webp">
+            <small class="text-muted" style="font-size:0.75rem;">{{ t('report.photo_help') }}</small>
+          </div>
+
+          <div class="col-12">
+            <label class="form-label small fw-semibold">{{ t('report.additional_notes') }}</label>
+            <textarea class="form-control" name="farmer_notes" rows="2" placeholder="{{ t('report.notes_placeholder') }}"></textarea>
+          </div>
+        </div>
+
+        <div class="alert alert-info py-2 small mt-4 mb-3">
+          <i class="fa-solid fa-circle-info me-1"></i><strong>{{ t('report.notice_title') }}:</strong> {{ t('report.report_notice') }}
+        </div>
+
+        <div class="text-center mt-4">
+          <button type="submit" class="btn btn-danger btn-lg px-5 shadow-sm">
+            <i class="fa-solid fa-microscope me-2"></i>{{ t('report.save_problem_report') }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Past Problem Reports History -->
+  {% if past_reports %}
+    <div class="card shadow-sm border-0">
+      <div class="card-header bg-white py-3">
+        <h5 class="mb-0 fw-bold"><i class="fa-solid fa-clock-rotate-left text-muted me-2"></i>{{ t('report.previous_reports') }}</h5>
+      </div>
+      <div class="card-body p-0">
+        <div class="list-group list-group-flush">
+          {% for r in past_reports %}
+            <a href="{{ url_for('disease_result_page', report_id=r.id) }}" class="list-group-item list-group-item-action p-3 d-flex justify-content-between align-items-center">
+              <div>
+                <span class="badge bg-light text-dark border me-1">{{ r.crop }}</span>
+                <span class="badge bg-{{ 'danger' if r.severity == 'Severe' else ('warning text-dark' if r.severity == 'Moderate' else 'info') }} me-1">{{ r.severity }}</span>
+                <strong class="d-block mt-1">{{ r.symptoms|truncate(80) }}</strong>
+                <small class="text-muted">{{ t('report.reported_on') }} {{ r.created_at }} &bull; {{ t('report.part_label') }}: {{ r.plant_part }}</small>
+              </div>
+              <div>
+                <span class="btn btn-sm btn-outline-secondary">{{ t('report.view_report') }} &rarr;</span>
+              </div>
+            </a>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

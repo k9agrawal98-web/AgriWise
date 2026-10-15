@@ -1,0 +1,108 @@
+{% extends 'base.html' %}
+{% block title %}Dashboard - AgriWise AI{% endblock %}
+{% block content %}
+<div class="dashboard-page">
+	<header class="dashboard-heading" data-motion='{"keyframes":{"opacity":[0,1],"y":[18,0]},"duration":0.7,"delay":0.05}'>
+		<div>
+			<p class="product-kicker">{{ t('dashboard.farm_briefing') }}</p>
+			<h1>{{ farm.farm_name }}</h1>
+			<p>{{ farm.location_name or t('dashboard.location_not_set') }} · {{ t('dashboard.updated_from_saved_context') }}</p>
+		</div>
+		<a class="product-text-link" href="{{ url_for('farm_profile') }}">{{ t('dashboard.farm_settings') }} <i class="fa-solid fa-arrow-up-right-from-square" aria-hidden="true"></i></a>
+	</header>
+
+	<section class="dashboard-insight" aria-labelledby="today-insight-title" data-motion='{"keyframes":{"opacity":[0,1],"x":[24,0]},"duration":0.8,"delay":0.1,"hover":{"to":{"y":-8,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.2}}'>
+		<div>
+			<div class="dashboard-insight__label"><i class="fa-solid fa-sun" aria-hidden="true"></i> {{ t('dashboard.today_action') }}</div>
+			{% if plan.do_first %}
+				<h2 id="today-insight-title">{{ plan.do_first.title }}</h2>
+				<p>{{ plan.do_first.reason }}</p>
+			{% else %}
+				<h2 id="today-insight-title">{{ t('dashboard.no_urgent') }}</h2>
+				<p>{{ t('dashboard.use_farm_plan') }}</p>
+			{% endif %}
+			<div class="dashboard-links">
+				<a class="product-button product-button--dark" href="{{ url_for('daily_plan_page') }}">{{ t('dashboard.open_plan') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+				<a class="product-button" href="{{ url_for('seven_day_plan_page') }}">{{ t('dashboard.seven_day_outlook') }}</a>
+			</div>
+		</div>
+		<aside class="dashboard-insight__evidence" aria-label="Recommendation context">
+			<h3>{{ t('dashboard.decision_context') }}</h3>
+			{% if plan.do_first %}<p>{{ plan.do_first.reason }}</p>{% else %}<p>{{ t('dashboard.decision_context_copy') }}</p>{% endif %}
+			{% if plan.do_first and plan.do_first.category %}<span class="status-pill">{{ plan.do_first.category }}</span>{% endif %}
+		</aside>
+	</section>
+
+	<section class="dashboard-metrics" aria-label="Current farm status">
+		<div class="dashboard-metric" data-motion='{"keyframes":{"opacity":[0,1],"y":[16,0]},"duration":0.6,"delay":0.15}'><span>{{ t('dashboard.current_crop') }}</span><strong>{{ latest_cycle.crop_name|title if latest_cycle else t('dashboard.not_started') }}</strong></div>
+		<div class="dashboard-metric" data-motion='{"keyframes":{"opacity":[0,1],"y":[16,0]},"duration":0.6,"delay":0.2}'><span>{{ t('dashboard.growth_stage') }}</span><strong>{{ crop_stage }}</strong></div>
+		<div class="dashboard-metric" data-motion='{"keyframes":{"opacity":[0,1],"y":[16,0]},"duration":0.6,"delay":0.25}'><span>{{ t('dashboard.temperature_now') }}</span><strong>{{ plan.weather.temperature|round|int ~ ' C' if plan.weather.temperature is not none else t('dashboard.unavailable') }}</strong></div>
+		<div class="dashboard-metric" data-motion='{"keyframes":{"opacity":[0,1],"y":[16,0]},"duration":0.6,"delay":0.3}'><span>{{ t('dashboard.pending_activities') }}</span><strong>{{ activity_counts.pending }}</strong></div>
+	</section>
+
+	<section class="dashboard-pulse" aria-label="Farm performance overview" data-motion='{"keyframes":{"opacity":[0,1],"y":[18,0]},"duration":0.8,"delay":0.18,"hover":{"to":{"y":-4,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.2}}'>
+		<div class="dashboard-pulse__summary">
+			<p class="dashboard-section-label">Operational pulse</p>
+			<h2>Farm status snapshot</h2>
+			<p>Everything is trending in the healthy range for this crop cycle, with the next action window focused on irrigation and nutrient timing.</p>
+		</div>
+		<div class="dashboard-pulse__cards">
+			<div class="pulse-card pulse-card--success">
+				<span>Soil health</span>
+				<strong>Good</strong>
+				<em>Balanced moisture and nutrient availability</em>
+			</div>
+			<div class="pulse-card pulse-card--warning">
+				<span>Weather signals</span>
+				<strong>Watch</strong>
+				<em>Light rainfall expected over the next 48 hours</em>
+			</div>
+			<div class="pulse-card pulse-card--info">
+				<span>Market timing</span>
+				<strong>Advantage</strong>
+				<em>Favorable regional price momentum </em>
+			</div>
+		</div>
+	</section>
+
+	<div class="dashboard-grid">
+		<section class="dashboard-panel" aria-labelledby="progress-title" data-motion='{"keyframes":{"opacity":[0,1],"y":[18,0]},"duration":0.75,"delay":0.25,"hover":{"to":{"y":-4,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.2}}'>
+			<div class="d-flex justify-content-between align-items-start gap-3"><div><p class="dashboard-section-label">{{ t('dashboard.crop_cycle') }}</p><h2 id="progress-title">{{ t('dashboard.estimated_progress') }}</h2></div><span class="status-pill">{{ progress|round|int }}%</span></div>
+			<div class="dashboard-crop-preview">
+				{% if latest_cycle %}
+				<div class="dashboard-crop-preview__scene" data-farm-scene="plant" data-stage="{{ crop_stage }}" data-progress="{{ progress }}" data-scene-state="loading" aria-hidden="true"><canvas></canvas></div>
+				{% else %}
+				<div class="dashboard-crop-preview__empty" aria-hidden="true"><i class="fa-solid fa-seedling"></i></div>
+				{% endif %}
+				<div>
+					<div class="lifecycle-progress" role="progressbar" aria-label="Estimated crop progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ progress|round|int }}"><span style="width: {{ progress }}%"></span></div>
+					<p class="small text-muted mt-2 mb-0">{% if latest_cycle %}{{ t('dashboard.progress_detail_with_cycle', sowing_date=latest_cycle.sowing_date) }}{% else %}{{ t('dashboard.progress_detail_empty') }}{% endif %}</p>
+					<a class="product-text-link mt-3" href="{{ url_for('lifecycle_page') }}">{{ t('dashboard.review_lifecycle') }} <i class="fa-solid fa-arrow-right" aria-hidden="true"></i></a>
+				</div>
+			</div>
+		</section>
+
+		<section class="dashboard-panel" aria-labelledby="activity-title" data-motion='{"keyframes":{"opacity":[0,1],"y":[18,0]},"duration":0.75,"delay":0.3,"hover":{"to":{"y":-4,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.2}}'>
+			<div class="d-flex justify-content-between align-items-start gap-3"><div><p class="dashboard-section-label">{{ t('dashboard.farmer_confirmed_work') }}</p><h2 id="activity-title">{{ t('dashboard.upcoming_activities') }}</h2></div><a class="product-text-link" href="{{ url_for('activities_page') }}">{{ t('dashboard.all_activities') }}</a></div>
+			{% for item in activities[:3] %}
+				<div class="dashboard-activity"><strong>{{ item.title }}</strong><span class="status-pill {{ item.display_status|lower }}">{{ item.display_status|title }}</span><span>{{ item.due_date }}</span><span>{{ item.activity_type }}</span></div>
+			{% else %}<p class="dashboard-empty">{{ t('dashboard.no_activities_recorded') }}</p>{% endfor %}
+		</section>
+
+		<section class="dashboard-panel dashboard-panel--wide" aria-labelledby="forecast-title" data-motion='{"keyframes":{"opacity":[0,1],"y":[18,0]},"duration":0.75,"delay":0.35,"hover":{"to":{"y":-4,"scale":1.01},"from":{"y":0,"scale":1},"duration":0.2}}'>
+			<div class="d-flex justify-content-between align-items-start gap-3"><div><p class="dashboard-section-label">{{ t('dashboard.openmeteo_forecast') }}</p><h2 id="forecast-title">{{ t('dashboard.next_seven_days') }}</h2></div><a class="product-text-link" href="{{ url_for('weather_page') }}">{{ t('dashboard.weather_details') }}</a></div>
+			{% if plan.forecast %}<div class="dashboard-forecast">{% for day in plan.forecast[:7] %}<div class="dashboard-forecast__day"><span>{{ day.date }}</span><strong>{{ day.temperature_max if day.temperature_max is not none else '—' }} C</strong><span>{{ day.precipitation if day.precipitation is not none else '—' }} mm rain</span></div>{% endfor %}</div>{% else %}<p class="dashboard-empty">{{ t('dashboard.forecast_unavailable') }}</p>{% endif %}
+		</section>
+
+		<section class="dashboard-panel" aria-labelledby="avoid-title">
+			<p class="dashboard-section-label">{{ t('dashboard.risk_prevention') }}</p><h2 id="avoid-title">{{ t('dashboard.watch_and_avoid') }}</h2>
+			{% for item in plan.avoid[:3] %}<div class="dashboard-activity"><strong>{{ item.action }}</strong><span>{{ item.reason }}</span></div>{% else %}<p class="dashboard-empty">{{ t('dashboard.no_avoidance_rule') }}</p>{% endfor %}
+		</section>
+
+		<section class="dashboard-panel" aria-labelledby="advisories-title">
+			<div class="d-flex justify-content-between align-items-start gap-3"><div><p class="dashboard-section-label">{{ t('dashboard.farm_history') }}</p><h2 id="advisories-title">{{ t('dashboard.recent_advisories') }}</h2></div><a class="product-text-link" href="{{ url_for('history_page') }}">{{ t('dashboard.history') }}</a></div>
+			{% for item in advisories[:3] %}<div class="dashboard-activity"><strong>{{ item.title }}</strong><span>{{ item.severity|title }}</span><span>{{ item.message }}</span></div>{% else %}<p class="dashboard-empty">{{ t('dashboard.no_saved_advisories') }}</p>{% endfor %}
+		</section>
+	</div>
+</div>
+{% endblock %}
